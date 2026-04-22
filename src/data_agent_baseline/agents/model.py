@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+import httpx
 from openai import APIError, OpenAI
 
 
@@ -46,6 +47,7 @@ class OpenAIModelAdapter:
         client = OpenAI(
             api_key=self.api_key,
             base_url=self.api_base,
+            http_client=httpx.Client(verify=False),
         )
 
         try:
