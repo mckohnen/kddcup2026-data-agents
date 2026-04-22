@@ -1,24 +1,25 @@
 import multiprocessing
 from pathlib import Path
-# from time import perf_counter
+from time import perf_counter
 
 import typer
 from rich.console import Console
-# from rich.progress import (
-#     BarColumn,
-#     Progress,
-#     SpinnerColumn,
-#     TaskProgressColumn,
-#     TextColumn,
-#     TimeElapsedColumn,
-#     TimeRemainingColumn,
-# )
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 # from rich.table import Table
 
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.config import load_app_config
-# from data_agent_baseline.run.runner import TaskRunArtifacts, create_run_output_dir, run_benchmark, run_single_task
+from data_agent_baseline.run.runner import TaskRunArtifacts, create_run_output_dir, run_benchmark, run_single_task
 # from data_agent_baseline.tools.filesystem import list_context_tree
+from data_agent_baseline.run.evaluate import evaluate_run, write_evaluation_report
 from data_agent_baseline.run.executor import TaskExecutor
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -37,40 +38,40 @@ console = Console()
 #     return "present" if path.exists() else "missing"
 
 
-# def _format_compact_rate(completed_count: int, elapsed_seconds: float) -> str:
-#     if completed_count <= 0 or elapsed_seconds <= 0:
-#         return "rate=0.0 task/min"
-#     return f"rate={(completed_count / elapsed_seconds) * 60:.1f} task/min"
+def _format_compact_rate(completed_count: int, elapsed_seconds: float) -> str:
+    if completed_count <= 0 or elapsed_seconds <= 0:
+        return "rate=0.0 task/min"
+    return f"rate={(completed_count / elapsed_seconds) * 60:.1f} task/min"
 
 
-# def _format_last_task(artifact: TaskRunArtifacts | None) -> str:
-#     if artifact is None:
-#         return "last=-"
-#     status = "ok" if artifact.succeeded else "fail"
-#     return f"last={artifact.task_id} ({status})"
+def _format_last_task(artifact: TaskRunArtifacts | None) -> str:
+    if artifact is None:
+        return "last=-"
+    status = "ok" if artifact.succeeded else "fail"
+    return f"last={artifact.task_id} ({status})"
 
 
-# def _build_compact_progress_fields(
-#     *,
-#     completed_count: int,
-#     succeeded_count: int,
-#     failed_count: int,
-#     task_total: int,
-#     max_workers: int,
-#     elapsed_seconds: float,
-#     last_artifact: TaskRunArtifacts | None,
-# ) -> dict[str, str]:
-#     remaining_count = max(task_total - completed_count, 0)
-#     running_count = min(max_workers, remaining_count)
-#     queued_count = max(remaining_count - running_count, 0)
-#     return {
-#         "ok": str(succeeded_count),
-#         "fail": str(failed_count),
-#         "run": str(running_count),
-#         "queue": str(queued_count),
-#         "speed": _format_compact_rate(completed_count, elapsed_seconds),
-#         "last": _format_last_task(last_artifact),
-#     }
+def _build_compact_progress_fields(
+    *,
+    completed_count: int,
+    succeeded_count: int,
+    failed_count: int,
+    task_total: int,
+    max_workers: int,
+    elapsed_seconds: float,
+    last_artifact: TaskRunArtifacts | None,
+) -> dict[str, str]:
+    remaining_count = max(task_total - completed_count, 0)
+    running_count = min(max_workers, remaining_count)
+    queued_count = max(remaining_count - running_count, 0)
+    return {
+        "ok": str(succeeded_count),
+        "fail": str(failed_count),
+        "run": str(running_count),
+        "queue": str(queued_count),
+        "speed": _format_compact_rate(completed_count, elapsed_seconds),
+        "last": _format_last_task(last_artifact),
+    }
 
 
 @app.callback()
@@ -157,127 +158,143 @@ def cli() -> None:
 #         console.print(f"Failure: {artifacts.failure_reason}")
 
 
-# @app.command("run-benchmark")
-# def run_benchmark_command(
-#     config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
-#     limit: int | None = typer.Option(None, min=1, help="Maximum number of tasks to run."),
-# ) -> None:
-#     """Run the ReAct baseline on multiple tasks from the config selection."""
-#     app_config = load_app_config(config)
-#     dataset = DABenchPublicDataset(app_config.dataset.root_path)
-#     task_total = len(dataset.iter_tasks())
-#     if limit is not None:
-#         task_total = min(task_total, limit)
-#     effective_workers = app_config.run.max_workers
-#
-#     progress_columns = [
-#         SpinnerColumn(),
-#         TextColumn("[progress.description]{task.description}"),
-#         BarColumn(),
-#         TaskProgressColumn(),
-#         TextColumn("[dim]|[/dim]"),
-#         TextColumn("[green]ok={task.fields[ok]}[/green]"),
-#         TextColumn("[red]fail={task.fields[fail]}[/red]"),
-#         TextColumn("[cyan]run={task.fields[run]}[/cyan]"),
-#         TextColumn("[yellow]queue={task.fields[queue]}[/yellow]"),
-#         TextColumn("[dim]|[/dim]"),
-#         TextColumn("{task.fields[speed]}"),
-#         TextColumn("[dim]| elapsed[/dim]"),
-#         TimeElapsedColumn(),
-#         TextColumn("[dim]| eta[/dim]"),
-#         TimeRemainingColumn(),
-#         TextColumn("[dim]|[/dim]"),
-#         TextColumn("{task.fields[last]}"),
-#     ]
-#     with Progress(*progress_columns, console=console) as progress:
-#         progress_task_id = progress.add_task(
-#             "Benchmark",
-#             total=task_total,
-#             completed=0,
-#             **_build_compact_progress_fields(
-#                 completed_count=0,
-#                 succeeded_count=0,
-#                 failed_count=0,
-#                 task_total=task_total,
-#                 max_workers=effective_workers,
-#                 elapsed_seconds=0.0,
-#                 last_artifact=None,
-#             ),
-#         )
-#
-#         completion_count = 0
-#         succeeded_count = 0
-#         failed_count = 0
-#         start_time = perf_counter()
-#
-#         def on_task_complete(artifact) -> None:
-#             nonlocal completion_count, succeeded_count, failed_count
-#             completion_count += 1
-#             if artifact.succeeded:
-#                 succeeded_count += 1
-#             else:
-#                 failed_count += 1
-#             progress.update(
-#                 progress_task_id,
-#                 completed=completion_count,
-#                 description="Benchmark",
-#                 refresh=True,
-#                 **_build_compact_progress_fields(
-#                     completed_count=completion_count,
-#                     succeeded_count=succeeded_count,
-#                     failed_count=failed_count,
-#                     task_total=task_total,
-#                     max_workers=effective_workers,
-#                     elapsed_seconds=perf_counter() - start_time,
-#                     last_artifact=artifact,
-#                 ),
-#             )
-#
-#         try:
-#             run_output_dir, artifacts = run_benchmark(
-#                 config=app_config,
-#                 limit=limit,
-#                 progress_callback=on_task_complete,
-#             )
-#         except (ValueError, FileExistsError) as exc:
-#             raise typer.BadParameter(str(exc), param_hint="run.run_id") from exc
-#         progress.update(
-#             progress_task_id,
-#             completed=task_total,
-#             description="Benchmark",
-#             refresh=True,
-#             **_build_compact_progress_fields(
-#                 completed_count=task_total,
-#                 succeeded_count=succeeded_count,
-#                 failed_count=failed_count,
-#                 task_total=task_total,
-#                 max_workers=effective_workers,
-#                 elapsed_seconds=perf_counter() - start_time,
-#                 last_artifact=artifacts[-1] if artifacts else None,
-#             ),
-#         )
-#     console.print(f"Run output: {run_output_dir}")
-#     console.print(f"Tasks attempted: {len(artifacts)}")
-#     console.print(f"Succeeded tasks: {sum(1 for item in artifacts if item.succeeded)}")
-
-
-@app.command("run-executor")
-def run_executor_command(
-    config: Path = typer.Option(DEFAULT_CONFIG, exists=True, dir_okay=False, help="YAML config path."),
+@app.command("run-benchmark")
+def run_benchmark_command(
+    config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
+    limit: int | None = typer.Option(None, min=1, help="Maximum number of tasks to run."),
 ) -> None:
-    """Run the input detector on all tasks."""
+    """Run the ReAct baseline on all tasks (input detection runs per task, evaluation at the end)."""
     app_config = load_app_config(config)
     dataset = DABenchPublicDataset(app_config.dataset.root_path)
     tasks = dataset.iter_tasks()
+    if limit is not None:
+        tasks = tasks[:limit]
 
-    executor = TaskExecutor(output_root=app_config.run.output_dir, run_id=app_config.run.run_id)
-    console.print(f"Run ID: {executor.run_id}")
+    # Step 1: run benchmark (input detection happens inside each task via run_single_task)
+    console.print("[bold]Step 1/2: Running benchmark...[/bold]")
+    task_total = len(tasks)
+    effective_workers = app_config.run.max_workers
 
-    for task in tasks:
-        task_output_dir = executor.execute_task(task)
-        console.print(f"[green]{task.task_id}[/green] -> {task_output_dir}")
+    progress_columns = [
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TextColumn("[dim]|[/dim]"),
+        TextColumn("[green]ok={task.fields[ok]}[/green]"),
+        TextColumn("[red]fail={task.fields[fail]}[/red]"),
+        TextColumn("[cyan]run={task.fields[run]}[/cyan]"),
+        TextColumn("[yellow]queue={task.fields[queue]}[/yellow]"),
+        TextColumn("[dim]|[/dim]"),
+        TextColumn("{task.fields[speed]}"),
+        TextColumn("[dim]| elapsed[/dim]"),
+        TimeElapsedColumn(),
+        TextColumn("[dim]| eta[/dim]"),
+        TimeRemainingColumn(),
+        TextColumn("[dim]|[/dim]"),
+        TextColumn("{task.fields[last]}"),
+    ]
+    with Progress(*progress_columns, console=console) as progress:
+        progress_task_id = progress.add_task(
+            "Benchmark",
+            total=task_total,
+            completed=0,
+            **_build_compact_progress_fields(
+                completed_count=0,
+                succeeded_count=0,
+                failed_count=0,
+                task_total=task_total,
+                max_workers=effective_workers,
+                elapsed_seconds=0.0,
+                last_artifact=None,
+            ),
+        )
 
-    console.print(f"\nDone. Output: {executor.run_output_dir}")
+        completion_count = 0
+        succeeded_count = 0
+        failed_count = 0
+        start_time = perf_counter()
+
+        def on_task_complete(artifact) -> None:
+            nonlocal completion_count, succeeded_count, failed_count
+            completion_count += 1
+            if artifact.succeeded:
+                succeeded_count += 1
+            else:
+                failed_count += 1
+            progress.update(
+                progress_task_id,
+                completed=completion_count,
+                description="Benchmark",
+                refresh=True,
+                **_build_compact_progress_fields(
+                    completed_count=completion_count,
+                    succeeded_count=succeeded_count,
+                    failed_count=failed_count,
+                    task_total=task_total,
+                    max_workers=effective_workers,
+                    elapsed_seconds=perf_counter() - start_time,
+                    last_artifact=artifact,
+                ),
+            )
+
+        try:
+            run_output_dir, artifacts = run_benchmark(
+                config=app_config,
+                limit=limit,
+                progress_callback=on_task_complete,
+            )
+        except (ValueError, FileExistsError) as exc:
+            raise typer.BadParameter(str(exc), param_hint="run.run_id") from exc
+        progress.update(
+            progress_task_id,
+            completed=task_total,
+            description="Benchmark",
+            refresh=True,
+            **_build_compact_progress_fields(
+                completed_count=task_total,
+                succeeded_count=succeeded_count,
+                failed_count=failed_count,
+                task_total=task_total,
+                max_workers=effective_workers,
+                elapsed_seconds=perf_counter() - start_time,
+                last_artifact=artifacts[-1] if artifacts else None,
+            ),
+        )
+    console.print(f"Run output: {run_output_dir}")
+    console.print(f"Tasks attempted: {len(artifacts)}")
+    console.print(f"Succeeded tasks: {sum(1 for item in artifacts if item.succeeded)}")
+
+    # Step 3: evaluate predictions against gold files
+    evaluation_dir = app_config.dataset.root_path.parent / "evaluation"
+    if evaluation_dir.exists():
+        console.print("\n[bold]Step 2/2: Evaluating predictions...[/bold]")
+        eval_result = evaluate_run(run_output_dir, evaluation_dir)
+        report_path = write_evaluation_report(eval_result, run_output_dir)
+        console.print(f"Evaluated: {eval_result.evaluated} tasks | Skipped: {eval_result.skipped} tasks")
+        console.print(f"[bold green]Mean score: {eval_result.mean_score:.4f}[/bold green]")
+        console.print(f"Report: {report_path}")
+    else:
+        console.print(f"\n[yellow]Evaluation dir not found ({evaluation_dir}), skipping evaluation.[/yellow]")
+
+
+# @app.command("run-executor")
+# def run_executor_command(
+#     config: Path = typer.Option(DEFAULT_CONFIG, exists=True, dir_okay=False, help="YAML config path."),
+# ) -> None:
+#     """Run the input detector on all tasks."""
+#     app_config = load_app_config(config)
+#     dataset = DABenchPublicDataset(app_config.dataset.root_path)
+#     tasks = dataset.iter_tasks()
+#
+#     executor = TaskExecutor(output_root=app_config.run.output_dir, run_id=app_config.run.run_id)
+#     console.print(f"Run ID: {executor.run_id}")
+#
+#     for task in tasks:
+#         task_output_dir = executor.execute_task(task)
+#         console.print(f"[green]{task.task_id}[/green] -> {task_output_dir}")
+#
+#     console.print(f"\nDone. Output: {executor.run_output_dir}")
 
 
 def main() -> None:

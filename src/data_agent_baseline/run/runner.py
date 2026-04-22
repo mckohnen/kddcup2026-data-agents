@@ -15,6 +15,7 @@ from data_agent_baseline.agents.model import OpenAIModelAdapter
 from data_agent_baseline.agents.react import ReActAgent, ReActAgentConfig
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.config import AppConfig
+from data_agent_baseline.tools.input_detector import detect_input_files
 from data_agent_baseline.tools.registry import ToolRegistry, create_default_tool_registry
 
 
@@ -57,7 +58,7 @@ def resolve_run_id(run_id: str | None = None) -> str:
 def create_run_output_dir(output_root: Path, *, run_id: str | None = None) -> tuple[str, Path]:
     effective_run_id = resolve_run_id(run_id)
     run_output_dir = output_root / effective_run_id
-    run_output_dir.mkdir(parents=True, exist_ok=False)
+    run_output_dir.mkdir(parents=True, exist_ok=True)
     return effective_run_id, run_output_dir
 
 
@@ -199,6 +200,13 @@ def run_single_task(
     model=None,
     tools: ToolRegistry | None = None,
 ) -> TaskRunArtifacts:
+    # Step 1: run input detection before the agent starts
+    task = DABenchPublicDataset(config.dataset.root_path).get_task(task_id)
+    task_output_dir = run_output_dir / task_id
+    task_output_dir.mkdir(parents=True, exist_ok=True)
+    input_files = detect_input_files(task)
+    _write_json(task_output_dir / "input_detection.json", {"task_id": task_id, "input_files": input_files})
+
     started_at = perf_counter()
     if model is None and tools is None:
         run_result = _run_single_task_with_timeout(task_id=task_id, config=config)
