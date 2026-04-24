@@ -51,3 +51,8 @@ $RECYCLE.BIN/
 *.swp
 *.swo
 *~
+
+# Docker files
+.dockerignore
+Dockerfile
+*team*.tar.gz
