@@ -1,3 +1,4 @@
+from data_agent_baseline.tools.input_detector import detect_input_files
 from data_agent_baseline.tools.registry import (
     ToolExecutionResult,
     ToolRegistry,
@@ -10,4 +11,5 @@ __all__ = [
     "ToolRegistry",
     "ToolSpec",
     "create_default_tool_registry",
+    "detect_input_files",
 ]

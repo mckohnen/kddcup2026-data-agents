@@ -13,12 +13,14 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
-from rich.table import Table
+# from rich.table import Table
 
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.config import load_app_config
 from data_agent_baseline.run.runner import TaskRunArtifacts, create_run_output_dir, run_benchmark, run_single_task
-from data_agent_baseline.tools.filesystem import list_context_tree
+# from data_agent_baseline.tools.filesystem import list_context_tree
+from data_agent_baseline.run.evaluate import evaluate_run, write_evaluation_report
+from data_agent_baseline.run.executor import TaskExecutor
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIGS_DIR = PROJECT_ROOT / "configs"
@@ -26,12 +28,14 @@ DATA_DIR = PROJECT_ROOT / "data"
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
 ARTIFACT_RUNS_DIR = ARTIFACTS_DIR / "runs"
 
+DEFAULT_CONFIG = CONFIGS_DIR / "react_baseline.yml"
+
 app = typer.Typer(add_completion=False, no_args_is_help=False)
 console = Console()
 
 
-def _status_value(path: Path) -> str:
-    return "present" if path.exists() else "missing"
+# def _status_value(path: Path) -> str:
+#     return "present" if path.exists() else "missing"
 
 
 def _format_compact_rate(completed_count: int, elapsed_seconds: float) -> str:
@@ -75,83 +79,83 @@ def cli() -> None:
     """Utilities for working with the local DABench baseline project."""
 
 
-@app.command()
-def status(
-    config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
-) -> None:
-    """Show the local project layout and public dataset presence."""
-    app_config = load_app_config(config)
-    config_path = config.resolve()
-    public_dataset = DABenchPublicDataset(app_config.dataset.root_path)
-
-    table = Table(title="DABench Baseline Status")
-    table.add_column("Item")
-    table.add_column("Path")
-    table.add_column("State")
-
-    table.add_row("project_root", str(PROJECT_ROOT), "ready")
-    table.add_row("data_dir", str(DATA_DIR), _status_value(DATA_DIR))
-    table.add_row("configs_dir", str(CONFIGS_DIR), _status_value(CONFIGS_DIR))
-    table.add_row("artifacts_dir", str(ARTIFACTS_DIR), _status_value(ARTIFACTS_DIR))
-    table.add_row("runs_dir", str(ARTIFACT_RUNS_DIR), _status_value(ARTIFACT_RUNS_DIR))
-    table.add_row("dataset_root", str(app_config.dataset.root_path), _status_value(app_config.dataset.root_path))
-    table.add_row("config_path", str(config_path), _status_value(config_path))
-
-    console.print(table)
-
-    if public_dataset.exists:
-        console.print(f"Public tasks: {len(public_dataset.list_task_ids())}")
-        counts = public_dataset.task_counts()
-        if counts:
-            rendered_counts = ", ".join(
-                f"{difficulty}={count}" for difficulty, count in sorted(counts.items())
-            )
-            console.print(f"Public task counts: {rendered_counts}")
-
-
-@app.command("inspect-task")
-def inspect_task(
-    task_id: str,
-    config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
-) -> None:
-    """Show task metadata and available context files."""
-    app_config = load_app_config(config)
-    dataset = DABenchPublicDataset(app_config.dataset.root_path)
-    task = dataset.get_task(task_id)
-    console.print(f"Task: {task.task_id}")
-    console.print(f"Difficulty: {task.difficulty}")
-    console.print(f"Question: {task.question}")
-    context_listing = list_context_tree(task)
-    table = Table(title=f"Context Files for {task.task_id}")
-    table.add_column("Path")
-    table.add_column("Kind")
-    table.add_column("Size")
-    for entry in context_listing["entries"]:
-        table.add_row(str(entry["path"]), str(entry["kind"]), str(entry["size"] or ""))
-    console.print(table)
+# @app.command()
+# def status(
+#     config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
+# ) -> None:
+#     """Show the local project layout and public dataset presence."""
+#     app_config = load_app_config(config)
+#     config_path = config.resolve()
+#     public_dataset = DABenchPublicDataset(app_config.dataset.root_path)
+#
+#     table = Table(title="DABench Baseline Status")
+#     table.add_column("Item")
+#     table.add_column("Path")
+#     table.add_column("State")
+#
+#     table.add_row("project_root", str(PROJECT_ROOT), "ready")
+#     table.add_row("data_dir", str(DATA_DIR), _status_value(DATA_DIR))
+#     table.add_row("configs_dir", str(CONFIGS_DIR), _status_value(CONFIGS_DIR))
+#     table.add_row("artifacts_dir", str(ARTIFACTS_DIR), _status_value(ARTIFACTS_DIR))
+#     table.add_row("runs_dir", str(ARTIFACT_RUNS_DIR), _status_value(ARTIFACT_RUNS_DIR))
+#     table.add_row("dataset_root", str(app_config.dataset.root_path), _status_value(app_config.dataset.root_path))
+#     table.add_row("config_path", str(config_path), _status_value(config_path))
+#
+#     console.print(table)
+#
+#     if public_dataset.exists:
+#         console.print(f"Public tasks: {len(public_dataset.list_task_ids())}")
+#         counts = public_dataset.task_counts()
+#         if counts:
+#             rendered_counts = ", ".join(
+#                 f"{difficulty}={count}" for difficulty, count in sorted(counts.items())
+#             )
+#             console.print(f"Public task counts: {rendered_counts}")
 
 
-@app.command("run-task")
-def run_task_command(
-    task_id: str,
-    config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
-) -> None:
-    """Run the ReAct baseline on one task."""
-    app_config = load_app_config(config)
-    try:
-        _, run_output_dir = create_run_output_dir(app_config.run.output_dir, run_id=app_config.run.run_id)
-    except (ValueError, FileExistsError) as exc:
-        raise typer.BadParameter(str(exc), param_hint="run.run_id") from exc
-    artifacts = run_single_task(task_id=task_id, config=app_config, run_output_dir=run_output_dir)
+# @app.command("inspect-task")
+# def inspect_task(
+#     task_id: str,
+#     config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
+# ) -> None:
+#     """Show task metadata and available context files."""
+#     app_config = load_app_config(config)
+#     dataset = DABenchPublicDataset(app_config.dataset.root_path)
+#     task = dataset.get_task(task_id)
+#     console.print(f"Task: {task.task_id}")
+#     console.print(f"Difficulty: {task.difficulty}")
+#     console.print(f"Question: {task.question}")
+#     context_listing = list_context_tree(task)
+#     table = Table(title=f"Context Files for {task.task_id}")
+#     table.add_column("Path")
+#     table.add_column("Kind")
+#     table.add_column("Size")
+#     for entry in context_listing["entries"]:
+#         table.add_row(str(entry["path"]), str(entry["kind"]), str(entry["size"] or ""))
+#     console.print(table)
 
-    console.print(f"Run output: {run_output_dir}")
-    console.print(f"Task output: {artifacts.task_output_dir}")
-    if artifacts.prediction_csv_path is not None:
-        console.print(f"Prediction CSV: {artifacts.prediction_csv_path}")
-    else:
-        console.print("Prediction CSV: not generated")
-    if artifacts.failure_reason is not None:
-        console.print(f"Failure: {artifacts.failure_reason}")
+
+# @app.command("run-task")
+# def run_task_command(
+#     task_id: str,
+#     config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
+# ) -> None:
+#     """Run the ReAct baseline on one task."""
+#     app_config = load_app_config(config)
+#     try:
+#         _, run_output_dir = create_run_output_dir(app_config.run.output_dir, run_id=app_config.run.run_id)
+#     except (ValueError, FileExistsError) as exc:
+#         raise typer.BadParameter(str(exc), param_hint="run.run_id") from exc
+#     artifacts = run_single_task(task_id=task_id, config=app_config, run_output_dir=run_output_dir)
+#
+#     console.print(f"Run output: {run_output_dir}")
+#     console.print(f"Task output: {artifacts.task_output_dir}")
+#     if artifacts.prediction_csv_path is not None:
+#         console.print(f"Prediction CSV: {artifacts.prediction_csv_path}")
+#     else:
+#         console.print("Prediction CSV: not generated")
+#     if artifacts.failure_reason is not None:
+#         console.print(f"Failure: {artifacts.failure_reason}")
 
 
 @app.command("run-benchmark")
@@ -159,12 +163,16 @@ def run_benchmark_command(
     config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
     limit: int | None = typer.Option(None, min=1, help="Maximum number of tasks to run."),
 ) -> None:
-    """Run the ReAct baseline on multiple tasks from the config selection."""
+    """Run the ReAct baseline on all tasks (input detection runs per task, evaluation at the end)."""
     app_config = load_app_config(config)
     dataset = DABenchPublicDataset(app_config.dataset.root_path)
-    task_total = len(dataset.iter_tasks())
+    tasks = dataset.iter_tasks()
     if limit is not None:
-        task_total = min(task_total, limit)
+        tasks = tasks[:limit]
+
+    # Step 1: run benchmark (input detection happens inside each task via run_single_task)
+    console.print("[bold]Step 1/2: Running benchmark...[/bold]")
+    task_total = len(tasks)
     effective_workers = app_config.run.max_workers
 
     progress_columns = [
@@ -256,6 +264,37 @@ def run_benchmark_command(
     console.print(f"Run output: {run_output_dir}")
     console.print(f"Tasks attempted: {len(artifacts)}")
     console.print(f"Succeeded tasks: {sum(1 for item in artifacts if item.succeeded)}")
+
+    # Step 3: evaluate predictions against gold files
+    evaluation_dir = app_config.dataset.root_path.parent / "evaluation"
+    if evaluation_dir.exists():
+        console.print("\n[bold]Step 2/2: Evaluating predictions...[/bold]")
+        eval_result = evaluate_run(run_output_dir, evaluation_dir)
+        report_path = write_evaluation_report(eval_result, run_output_dir)
+        console.print(f"Evaluated: {eval_result.evaluated} tasks | Skipped: {eval_result.skipped} tasks")
+        console.print(f"[bold green]Mean score: {eval_result.mean_score:.4f}[/bold green]")
+        console.print(f"Report: {report_path}")
+    else:
+        console.print(f"\n[yellow]Evaluation dir not found ({evaluation_dir}), skipping evaluation.[/yellow]")
+
+
+# @app.command("run-executor")
+# def run_executor_command(
+#     config: Path = typer.Option(DEFAULT_CONFIG, exists=True, dir_okay=False, help="YAML config path."),
+# ) -> None:
+#     """Run the input detector on all tasks."""
+#     app_config = load_app_config(config)
+#     dataset = DABenchPublicDataset(app_config.dataset.root_path)
+#     tasks = dataset.iter_tasks()
+#
+#     executor = TaskExecutor(output_root=app_config.run.output_dir, run_id=app_config.run.run_id)
+#     console.print(f"Run ID: {executor.run_id}")
+#
+#     for task in tasks:
+#         task_output_dir = executor.execute_task(task)
+#         console.print(f"[green]{task.task_id}[/green] -> {task_output_dir}")
+#
+#     console.print(f"\nDone. Output: {executor.run_output_dir}")
 
 
 def main() -> None:

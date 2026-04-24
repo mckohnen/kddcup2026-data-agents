@@ -1,88 +1,69 @@
 <div align="center">
 
-# DataAgent-Bench Starter Kit
+# KDD Cup 2026 Data Agents — Team team1210
 
-English | [中文](README.zh.md)
-
-[![Official Website](https://img.shields.io/badge/Official%20Website-Visit%20dataagent.top-0ea5e9?style=for-the-badge&logo=googlechrome&logoColor=white&labelColor=0f172a)](https://dataagent.top)
-[![Demo Dataset](https://img.shields.io/badge/Demo%20Dataset-Download%20Phase%201-f59e0b?style=for-the-badge&logo=googledrive&logoColor=white&labelColor=0f172a)](https://drive.google.com/file/d/1c6u5WlFw4KV7CBRyXh5BvFYbKqxhBSbL/view)
+[![Official Website](https://img.shields.io/badge/Official%20Website-dataagent.top-0ea5e9?style=for-the-badge&logo=googlechrome&logoColor=white&labelColor=0f172a)](https://dataagent.top)
+[![Demo Dataset](https://img.shields.io/badge/Demo%20Dataset-Phase%201-f59e0b?style=for-the-badge&logo=googledrive&logoColor=white&labelColor=0f172a)](https://drive.google.com/file/d/1c6u5WlFw4KV7CBRyXh5BvFYbKqxhBSbL/view)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=for-the-badge&logo=discord&logoColor=white&labelColor=0f172a)](https://discord.com/invite/7eFwJQN3Fx)
 
 </div>
 
-> Official starter kit for the KDD Cup 2026 DataAgent-Bench challenge. The repository reads tasks from `data/public/input/` and writes predictions for downstream evaluation.
+Team **"Zero Sugar Full Intelligence"** (team1210) — competition fork of the [official KDD Cup 2026 DataAgent-Bench starter kit](https://github.com/HKUSTDial/kddcup2026-data-agents-starter-kit).
 
-## Overview
+The agent receives tabular-data tasks, reasons over the provided context files, and writes a `prediction.csv` answering each question.
 
-| Item | Value |
-| --- | --- |
-| Dataset input | `data/public/input/` |
-| Public demo ground truth | `data/public/output/task_<id>/gold.csv` |
-| Hidden test data | `input/` only, no `output/` |
-| Entry command | `uv run dabench <command> --config PATH` |
-| Default run output | `artifacts/runs/` |
+## Quick start
 
-## Quick Start
+**Prerequisites:** [uv](https://docs.astral.sh/uv/getting-started/installation/) and Python ≥ 3.10.
 
-1. Install `uv` by following the official guide:
-   - https://docs.astral.sh/uv/getting-started/installation/
-2. On macOS and Linux, the standalone installer is:
+```bash
+# 1. Install dependencies
+uv sync
 
-   ```bash
-   curl -LsSf https://astral.sh/uv/install.sh | sh
-   ```
+# 2. Create a local config from the example
+cp configs/react_baseline.example.yaml configs/react_baseline.local.yaml
+# Edit the copy: set model, api_base, api_key, and dataset root path
 
-3. Install project dependencies:
+# 3. Run the benchmark against the public dataset
+uv run dabench run-benchmark --config configs/react_baseline.local.yaml
 
-   ```bash
-   uv sync
-   ```
+# Optional: cap the number of tasks
+uv run dabench run-benchmark --config configs/react_baseline.local.yaml --limit 10
+```
 
-4. Confirm the dataset root is visible:
-
-   ```bash
-   uv run dabench status --config configs/react_baseline.example.yaml
-   ```
-
-5. Run the baseline:
-
-   ```bash
-   uv run dabench run-benchmark --config configs/react_baseline.example.yaml
-   ```
+`configs/react_baseline.local.yaml` is git-ignored — never commit API keys.
 
 ## Dataset
 
-The public demo dataset lives under `data/public/input/`. Each task directory follows this structure:
+Download the Phase 1 public demo dataset and place it at `data/public/input/`.
 
-```text
+Each task directory has this structure:
+
+```
 data/public/input/task_<id>/
-├── task.json
-└── context/
+├── task.json        # task_id, difficulty, question
+└── context/         # csv/, db/, json/, doc/ files — varies per task
 ```
 
-The corresponding public demo answers live separately under `data/public/output/task_<id>/gold.csv`.
-Hidden test sets only include `input/`, so there is no `output/` directory there.
+Public ground-truth answers (for local evaluation) live at `data/public/evaluation/task_<id>/gold.csv`.
+Evaluation runs automatically at the end of `run-benchmark` when that directory is present.
 
-`task.json` contains:
+Run outputs are written to:
 
-- `task_id`
-- `difficulty`
-- `question`
-
-The `context/` directory may contain one or more of:
-
-- CSV files
-- JSON files
-- SQLite / DB files
-- Text documents
+```
+artifacts/runs/<run_id>/
+├── summary.json
+└── task_<id>/
+    ├── trace.json          # full agent step trace
+    ├── prediction.csv      # answer table
+    └── input_detection.json
+```
 
 ## Configuration
 
-An example config file lives at `configs/react_baseline.example.yaml`.
-
 ```yaml
 dataset:
-  root_path: data/public/input
+  root_path: data/public/input   # relative to project root, or absolute
 
 agent:
   model: YOUR_MODEL_NAME
@@ -93,133 +74,89 @@ agent:
 
 run:
   output_dir: artifacts/runs
-  run_id:
+  run_id:                        # leave blank for a UTC timestamp; must be unique
   max_workers: 4
   task_timeout_seconds: 600
 ```
 
-Config fields:
+## Architecture
 
-| Field | Meaning |
+```
+task.json + context/
+       │
+       ▼
+ InputDetector          classifies context files (csv / db / json / doc)
+       │
+       ▼
+ EasyTaskAgent          specialised for "easy" difficulty
+       │
+       ▼
+ ReActAgent loop        Thought → Action (JSON) → Observation → repeat
+       │
+       ▼
+ ToolRegistry           routes actions to tool implementations
+       │
+       ▼
+ prediction.csv
+```
+
+**Tools available to the easy-task agent:**
+
+| Tool | Purpose |
 | --- | --- |
-| `dataset.root_path` | Root directory of the public demo `input/` dataset. Relative paths are resolved from the project root. |
-| `agent.model` | Model name. |
-| `agent.api_base` | OpenAI-compatible API base URL. |
-| `agent.api_key` | API key, read directly from the config file. |
-| `agent.max_steps` | Maximum ReAct steps per task. |
-| `agent.temperature` | Sampling temperature. |
-| `run.output_dir` | Output directory for run artifacts. |
-| `run.run_id` | Optional run directory name. Defaults to a UTC timestamp if omitted. Must be a single directory name; existing run directories are rejected. |
-| `run.max_workers` | Parallel worker count for `run-benchmark`. |
-| `run.task_timeout_seconds` | Maximum wall-clock time per task. Set to `0` or a negative value to disable the task-level timeout. |
+| `read_doc` | Read a text/markdown file (primarily `knowledge.md`) |
+| `show_context_schema` | Load all JSON/CSV files into in-memory SQLite and return schema + sample rows |
+| `query_context_tables` | Run a SQL query over the in-memory SQLite tables |
+| `answer` | Submit the final result table (terminates the agent) |
 
-## CLI
+Only `easy` difficulty tasks are handled in the current version.
+
+## Submission
+
+### Build and package the Docker image
 
 ```bash
-uv run dabench <command> --config PATH [options]
+./scripts/build_submission.sh team1210 <N>
+# Produces: team1210_v<N>.tar.gz  (upload this to Google Drive)
 ```
 
-| Command | Purpose | Example |
-| --- | --- | --- |
-| `status` | Show project paths, config path, dataset root, and public task counts. | `uv run dabench status --config configs/react_baseline.example.yaml` |
-| `inspect-task` | Show task metadata and list accessible files under `context/`. | `uv run dabench inspect-task task_1 --config configs/react_baseline.local.yaml` |
-| `run-task` | Run the baseline on one task and write outputs. | `uv run dabench run-task task_1 --config configs/react_baseline.local.yaml` |
-| `run-benchmark` | Run the baseline across the public dataset. | `uv run dabench run-benchmark --config configs/react_baseline.local.yaml` |
+Version numbers must increment; max image size is 10 GB; max 1 submission per day.
 
-`run-benchmark` also supports `--limit N` to cap the number of tasks.
+### Email the organizers
 
-## Tools
-
-The baseline exposes these tools to the model:
-
-| Tool | Purpose | Inputs |
-| --- | --- | --- |
-| `list_context` | List files and directories under `context/`. | `max_depth` |
-| `read_csv` | Read a CSV preview. | `path`, `max_rows` |
-| `read_json` | Read a JSON preview. | `path`, `max_chars` |
-| `read_doc` | Read a text document preview. | `path`, `max_chars` |
-| `inspect_sqlite_schema` | Inspect tables in a SQLite / DB file. | `path` |
-| `execute_context_sql` | Execute read-only SQL against a SQLite / DB file in `context/`. | `path`, `sql`, `limit` |
-| `execute_python` | Execute arbitrary Python code inside the task `context/` directory. | `code` |
-| `answer` | Submit the final answer table and terminate the task. | `columns`, `rows` |
-
-All file paths passed to tools must be relative to the task `context/` directory.
-
-## Outputs
-
-Each successful task run may produce:
-
-- `trace.json`
-- `prediction.csv`
-
-Per-task outputs are written to:
-
-```text
-artifacts/runs/<run_id>/<task_id>/
-├── trace.json
-└── prediction.csv
+```
+Subject: [KDDCup2026 Data Agents] Submission - team1210 - v<N>
 ```
 
-Benchmark runs also write:
+Include: team ID, version number, shareable Google Drive link (set to "Anyone with link can view").
 
-```text
-artifacts/runs/<run_id>/summary.json
+### Test the container locally before submitting
+
+```bash
+docker build -t team1210:vlocal .
+docker run --rm \
+  -v "$(pwd)/data/public/input:/input:ro" \
+  -v "$(pwd)/artifacts/docker_out:/output" \
+  -v "$(pwd)/artifacts/docker_logs:/logs" \
+  -e MODEL_API_URL=<url> \
+  -e MODEL_API_KEY=<key> \
+  -e MODEL_NAME=<model> \
+  team1210:vlocal
 ```
 
-## Contact
+The evaluator injects `MODEL_API_URL`, `MODEL_API_KEY`, and `MODEL_NAME` at runtime — no credentials are baked into the image.
 
-- Open issues: https://github.com/HKUSTDial/kddcup2026-data-agents-starter-kit/issues
-- Official website: https://dataagent.top
-- Discord: https://discord.com/invite/7eFwJQN3Fx
-- WeChat official account: `数据智能与分析实验室 DIAL`
-
-<div align="center">
-  <table>
-    <tr>
-      <td align="center">
-        <a href="https://dataagent.top">
-          <img
-            src="https://api.qrserver.com/v1/create-qr-code/?size=144x144&data=https://dataagent.top&bgcolor=ffffff&color=111827&margin=8"
-            alt="Official website QR code"
-            width="144"
-          />
-        </a>
-        <br />
-        Official Website
-      </td>
-      <td align="center">
-        <a href="https://discord.com/invite/7eFwJQN3Fx">
-          <img
-            src="https://api.qrserver.com/v1/create-qr-code/?size=144x144&data=https://discord.com/invite/7eFwJQN3Fx&bgcolor=ffffff&color=111827&margin=8"
-            alt="Discord QR code"
-            width="144"
-          />
-        </a>
-        <br />
-        Discord
-      </td>
-      <td align="center">
-        <img
-          src="https://dataagent.top/HKUSTGZ_DIAL.jpg"
-          alt="WeChat official account QR code"
-          width="144"
-        />
-        <br />
-        WeChat Official Account
-      </td>
-    </tr>
-  </table>
-</div>
-
-## Main Modules
+## Key modules
 
 | Module | Responsibility |
 | --- | --- |
-| `src/data_agent_baseline/benchmark/dataset.py` | Public dataset loader |
-| `src/data_agent_baseline/tools/filesystem.py` | `list_context`, `read_csv`, `read_json`, `read_doc` |
-| `src/data_agent_baseline/tools/python_exec.py` | `execute_python` |
-| `src/data_agent_baseline/tools/sqlite.py` | `inspect_sqlite_schema`, `execute_context_sql` |
-| `src/data_agent_baseline/tools/registry.py` | Tool registration and terminal `answer` |
-| `src/data_agent_baseline/agents/prompt.py` | System prompt, task prompt, observation prompt |
-| `src/data_agent_baseline/agents/react.py` | ReAct runtime with JSON action protocol |
+| `src/data_agent_baseline/agents/react.py` | Generic ReAct loop with JSON action protocol |
+| `src/data_agent_baseline/agents/easy_task_agent.py` | Easy-task agent and its tool registry |
+| `src/data_agent_baseline/agents/model.py` | OpenAI-compatible model adapter |
+| `src/data_agent_baseline/benchmark/dataset.py` | Dataset loader (`DABenchPublicDataset`) |
+| `src/data_agent_baseline/tools/context_sqlite.py` | In-memory SQLite over JSON/CSV context |
+| `src/data_agent_baseline/tools/input_detector.py` | Context file classifier |
 | `src/data_agent_baseline/run/runner.py` | Single-task and benchmark execution |
+| `src/data_agent_baseline/run/evaluate.py` | Local scoring against gold CSVs |
+| `src/data_agent_baseline/config.py` | Config dataclasses and YAML loader |
+| `submit.py` | Docker entrypoint (reads env vars, not YAML) |
