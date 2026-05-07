@@ -4,7 +4,7 @@ from data_agent_baseline.agents.model import ModelAdapter
 from data_agent_baseline.agents.react import ReActAgent, ReActAgentConfig
 from data_agent_baseline.benchmark.schema import AnswerTable, PublicTask
 from data_agent_baseline.tools.context_sqlite import get_context_schema, run_sql_on_context
-from data_agent_baseline.tools.filesystem import read_doc_preview
+from data_agent_baseline.tools.filesystem import read_doc_preview, _extract_md_toc, _extract_md_section
 from data_agent_baseline.tools.registry import (
     ToolExecutionResult,
     ToolRegistry,
@@ -12,27 +12,28 @@ from data_agent_baseline.tools.registry import (
 )
 
 EASY_TASK_SYSTEM_PROMPT = """
-You are a data agent solving an easy data task. Follow these steps in order:
+You are a data agent solving a data task. Follow these steps:
 
-Step 1 — Read knowledge.md:
-  Use read_doc with path "knowledge.md". This file defines column semantics, field encodings,
-  and contains Use Case SQL examples that often directly answer the question. Read it first.
+Step 1 — Inspect schema:
+  Call show_context_schema to see all available tables, columns, row counts, and sample values.
 
-Step 2 — Inspect schema:
-  Use show_context_schema to see all available tables, columns, row counts, and sample values.
-  Identify which tables contain the data needed for the question.
+Step 2 — Resolve ambiguities (only if needed):
+  If the question or schema is ambiguous (unclear encoding, filter value, or calculation), call
+  read_knowledge_section to look up the relevant part of knowledge.md. Available sections:
+    "## 2. Core Entities & Fields"  — column meanings and value encodings
+    "## 3. Metric Definitions"      — KPI formulas and calculation logic
+    "## 4. Constraints & Conventions" — filtering rules, units, formats
+    "## 5. Exemplar Use Cases"      — SQL patterns that directly model the question
+    "## 6. Ambiguity Resolution"    — field priority and disambiguation rules
 
 Step 3 — Run SQL:
-  Use query_context_tables with SQL that answers the question. Rules:
-  - Mirror SQL patterns from knowledge.md Use Case examples as closely as possible
+  Write SQL that answers the question directly from the schema. Rules:
   - Output only the columns explicitly requested in the question
-  - Match filter values exactly to the question wording (knowledge.md defines encodings)
-  - Use raw/event tables rather than derived views
   - JSON-sourced columns preserve native types (integers stay integers — no CAST needed)
   - CSV-sourced columns are stored as TEXT — use CAST(col AS INTEGER) for numeric comparisons
 
 Step 4 — Validate:
-  After running SQL check that row count is non-zero and no key columns are all NULL.
+  Check that row count is non-zero and no key columns are all NULL.
   If the result looks wrong, revise the SQL and re-run.
 
 Step 5 — Submit:
@@ -53,10 +54,31 @@ def _query_context_tables(task: PublicTask, action_input: dict) -> ToolExecution
     return ToolExecutionResult(ok=True, content=result)
 
 
+def _read_knowledge_section(task: PublicTask, action_input: dict) -> ToolExecutionResult:
+    from pathlib import Path
+    knowledge_path = task.context_dir / "knowledge.md"
+    if not knowledge_path.exists():
+        return ToolExecutionResult(ok=False, content={"error": "knowledge.md not found in context."})
+    text = knowledge_path.read_text(encoding="utf-8", errors="replace")
+    section = action_input.get("section", "").strip()
+    if not section:
+        toc = _extract_md_toc(text)
+        return ToolExecutionResult(ok=True, content={"sections": toc})
+    extracted = _extract_md_section(text, section)
+    if not extracted:
+        toc = _extract_md_toc(text)
+        return ToolExecutionResult(ok=True, content={
+            "error": f"Section '{section}' not found.",
+            "available_sections": toc,
+        })
+    return ToolExecutionResult(ok=True, content={"section": section, "content": extracted})
+
+
 def _read_doc(task: PublicTask, action_input: dict) -> ToolExecutionResult:
     path = str(action_input["path"])
     max_chars = int(action_input.get("max_chars", 8000))
-    return ToolExecutionResult(ok=True, content=read_doc_preview(task, path, max_chars=max_chars))
+    content = read_doc_preview(task, path, max_chars=max_chars, query=task.question)
+    return ToolExecutionResult(ok=True, content=content)
 
 
 def _answer(_: PublicTask, action_input: dict) -> ToolExecutionResult:
@@ -85,11 +107,6 @@ def _answer(_: PublicTask, action_input: dict) -> ToolExecutionResult:
 
 def create_easy_task_tool_registry() -> ToolRegistry:
     specs = {
-        "read_doc": ToolSpec(
-            name="read_doc",
-            description="Read a text/markdown file from context (use for knowledge.md).",
-            input_schema={"path": "knowledge.md", "max_chars": 8000},
-        ),
         "show_context_schema": ToolSpec(
             name="show_context_schema",
             description=(
@@ -106,6 +123,23 @@ def create_easy_task_tool_registry() -> ToolRegistry:
             ),
             input_schema={"sql": "SELECT ...", "limit": 200},
         ),
+        "read_knowledge_section": ToolSpec(
+            name="read_knowledge_section",
+            description=(
+                "Read a section from knowledge.md by its ## header. "
+                "Omit 'section' to get the table of contents. "
+                "Use only when the schema or question is ambiguous."
+            ),
+            input_schema={"section": "## 5. Exemplar Use Cases"},
+        ),
+        "read_doc": ToolSpec(
+            name="read_doc",
+            description=(
+                "Read a file from the doc/ directory (e.g. doc/Patient.md). "
+                "Use when additional domain context beyond knowledge.md is needed."
+            ),
+            input_schema={"path": "doc/filename.md"},
+        ),
         "answer": ToolSpec(
             name="answer",
             description="Submit the final answer table. This is the only valid terminating action.",
@@ -113,16 +147,17 @@ def create_easy_task_tool_registry() -> ToolRegistry:
         ),
     }
     handlers = {
-        "read_doc": _read_doc,
         "show_context_schema": _show_context_schema,
         "query_context_tables": _query_context_tables,
+        "read_knowledge_section": _read_knowledge_section,
+        "read_doc": _read_doc,
         "answer": _answer,
     }
     return ToolRegistry(specs=specs, handlers=handlers)
 
 
 class EasyTaskAgent:
-    def __init__(self, *, model: ModelAdapter, max_steps: int = 8) -> None:
+    def __init__(self, *, model: ModelAdapter, max_steps: int = 10) -> None:
         self._agent = ReActAgent(
             model=model,
             tools=create_easy_task_tool_registry(),

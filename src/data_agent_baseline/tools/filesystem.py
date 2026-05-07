@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from pathlib import Path
 
 from data_agent_baseline.benchmark.schema import PublicTask
@@ -77,11 +78,71 @@ def read_json_preview(task: PublicTask, relative_path: str, *, max_chars: int = 
     }
 
 
-def read_doc_preview(task: PublicTask, relative_path: str, *, max_chars: int = 4000) -> dict[str, object]:
+def _extract_md_toc(text: str) -> list[str]:
+    return re.findall(r"^#{1,6} .+", text, re.MULTILINE)
+
+
+def _extract_md_section(text: str, section: str) -> str:
+    """Return the matched section including all subsections (stops at next header of same or higher level)."""
+    matches = list(re.finditer(r"^(#{1,6}) .+", text, re.MULTILINE))
+    for i, m in enumerate(matches):
+        line_end = text.index("\n", m.start()) if "\n" in text[m.start():] else len(text)
+        header_text = text[m.start() : line_end].strip()
+        if header_text.lower() == section.lower():
+            level = len(m.group(1))
+            end = len(text)
+            for j in range(i + 1, len(matches)):
+                if len(matches[j].group(1)) <= level:
+                    end = matches[j].start()
+                    break
+            return text[m.start() : end].strip()
+    return ""
+
+
+def read_doc_preview(
+    task: PublicTask,
+    relative_path: str,
+    *,
+    max_chars: int = 4000,
+    query: str | None = None,
+    section: str | None = None,
+) -> dict[str, object]:
     path = resolve_context_path(task, relative_path)
     text = path.read_text(encoding="utf-8", errors="replace")
+
+    # Agent requested a specific section by header text
+    if section:
+        extracted = _extract_md_section(text, section)
+        return {
+            "path": relative_path,
+            "section": section,
+            "preview": extracted if extracted else f"Section '{section}' not found.",
+        }
+
+    # For knowledge.md: return TOC so agent selects only relevant sections
+    if relative_path == "knowledge.md":
+        toc = _extract_md_toc(text)
+        return {
+            "path": relative_path,
+            "sections": toc,
+            "hint": "Call read_doc again with 'section' set to a header (e.g. '## Use Cases') to read that section.",
+        }
+
+    # For doc/ files: BM25 retrieval when too large
+    is_doc_dir_file = relative_path.startswith("doc/") or "/doc/" in relative_path
+    if query and is_doc_dir_file and len(text) > max_chars:
+        from data_agent_baseline.tools.md_retrieval import retrieve_relevant_chunks
+
+        preview = retrieve_relevant_chunks(text, query, max_chars=max_chars)
+        return {
+            "path": relative_path,
+            "preview": preview,
+            "truncated": True,
+            "retrieval": "bm25",
+        }
+
     return {
         "path": relative_path,
-        "preview": text[:max_chars],
-        "truncated": len(text) > max_chars,
+        "preview": text,
+        "truncated": False,
     }
