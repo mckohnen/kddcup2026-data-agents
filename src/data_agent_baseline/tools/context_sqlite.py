@@ -84,6 +84,56 @@ def load_context_to_sqlite(context_dir: Path) -> sqlite3.Connection:
     return conn
 
 
+def load_raw_tables(context_dir: Path) -> list[dict[str, Any]]:
+    """Load all JSON and CSV files from context as raw record dicts (no SQLite)."""
+    raw: list[dict[str, Any]] = []
+
+    for json_file in sorted(context_dir.rglob("*.json")):
+        try:
+            payload = json.loads(json_file.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and "records" in payload:
+                table_name = str(payload.get("table", json_file.stem))
+                records: list[dict[str, Any]] = payload["records"]
+            elif isinstance(payload, list):
+                table_name = json_file.stem
+                records = payload
+            else:
+                continue
+            if records:
+                raw.append({"table": table_name, "records": records})
+        except Exception:
+            pass
+
+    for csv_file in sorted(context_dir.rglob("*.csv")):
+        try:
+            with csv_file.open(newline="", encoding="utf-8") as f:
+                records_str = list(csv.DictReader(f))
+            if records_str:
+                raw.append({"table": csv_file.stem, "records": records_str})
+        except Exception:
+            pass
+
+    db_extensions = ("*.db", "*.sqlite", "*.sqlite3")
+    for pattern in db_extensions:
+        for db_file in sorted(context_dir.rglob(pattern)):
+            try:
+                db_conn = sqlite3.connect(str(db_file))
+                db_conn.row_factory = sqlite3.Row
+                db_tables = db_conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+                ).fetchall()
+                for (table_name,) in db_tables:
+                    rows = db_conn.execute(f'SELECT * FROM "{_sanitize(table_name)}"').fetchall()
+                    records_db: list[dict[str, Any]] = [dict(r) for r in rows]
+                    if records_db:
+                        raw.append({"table": table_name, "records": records_db})
+                db_conn.close()
+            except Exception:
+                pass
+
+    return raw
+
+
 def get_context_schema(context_dir: Path) -> list[dict[str, Any]]:
     """Return schema + sample rows for all tables loaded from context."""
     conn = load_context_to_sqlite(context_dir)

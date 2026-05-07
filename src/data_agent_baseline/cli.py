@@ -166,7 +166,7 @@ def run_benchmark_command(
     """Run the ReAct baseline on all tasks (input detection runs per task, evaluation at the end)."""
     app_config = load_app_config(config)
     dataset = DABenchPublicDataset(app_config.dataset.root_path)
-    tasks = dataset.iter_tasks()
+    tasks = dataset.iter_tasks(difficulty="easy")
     if limit is not None:
         tasks = tasks[:limit]
 

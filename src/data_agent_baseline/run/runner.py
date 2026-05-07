@@ -138,8 +138,9 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
     if timeout_seconds <= 0:
         return _run_single_task_core(task_id=task_id, config=config)
 
-    queue: multiprocessing.Queue[Any] = multiprocessing.Queue()
-    process = multiprocessing.Process(
+    ctx = multiprocessing.get_context("spawn")
+    queue: multiprocessing.Queue[Any] = ctx.Queue()
+    process = ctx.Process(
         target=_run_single_task_in_subprocess,
         args=(task_id, config, queue),
     )
@@ -258,6 +259,12 @@ def run_benchmark(
             task_artifacts.append(artifact)
             if progress_callback is not None:
                 progress_callback(artifact)
+        if hasattr(shared_model, "total_input_tokens"):
+            print(
+                f"\n[tokens] RUN TOTAL: in={shared_model.total_input_tokens} out={shared_model.total_output_tokens}"
+                f" | tasks={len(task_artifacts)} succeeded={sum(1 for a in task_artifacts if a.succeeded)}",
+                flush=True,
+            )
     else:
         with ThreadPoolExecutor(max_workers=effective_workers) as executor:
             future_to_index = {

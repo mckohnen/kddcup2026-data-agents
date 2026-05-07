@@ -3,7 +3,8 @@ from __future__ import annotations
 from data_agent_baseline.agents.model import ModelAdapter
 from data_agent_baseline.agents.react import ReActAgent, ReActAgentConfig
 from data_agent_baseline.benchmark.schema import AnswerTable, PublicTask
-from data_agent_baseline.tools.context_sqlite import get_context_schema, run_sql_on_context
+from data_agent_baseline.tools.context_sqlite import run_sql_on_context
+from data_agent_baseline.tools.schema_profiler import build_schema_profile
 from data_agent_baseline.tools.filesystem import read_doc_preview, _extract_md_toc, _extract_md_section
 from data_agent_baseline.tools.registry import (
     ToolExecutionResult,
@@ -20,6 +21,7 @@ Step 1 — Inspect schema:
 Step 2 — Resolve ambiguities (only if needed):
   If the question or schema is ambiguous (unclear encoding, filter value, or calculation), call
   read_knowledge_section to look up the relevant part of knowledge.md. Available sections:
+    "## 1. Introduction"
     "## 2. Core Entities & Fields"  — column meanings and value encodings
     "## 3. Metric Definitions"      — KPI formulas and calculation logic
     "## 4. Constraints & Conventions" — filtering rules, units, formats
@@ -43,8 +45,7 @@ Step 5 — Submit:
 
 def _show_context_schema(task: PublicTask, action_input: dict) -> ToolExecutionResult:
     del action_input
-    tables = get_context_schema(task.context_dir)
-    return ToolExecutionResult(ok=True, content={"tables": tables})
+    return ToolExecutionResult(ok=True, content=build_schema_profile(task.context_dir))
 
 
 def _query_context_tables(task: PublicTask, action_input: dict) -> ToolExecutionResult:
@@ -55,7 +56,6 @@ def _query_context_tables(task: PublicTask, action_input: dict) -> ToolExecution
 
 
 def _read_knowledge_section(task: PublicTask, action_input: dict) -> ToolExecutionResult:
-    from pathlib import Path
     knowledge_path = task.context_dir / "knowledge.md"
     if not knowledge_path.exists():
         return ToolExecutionResult(ok=False, content={"error": "knowledge.md not found in context."})
