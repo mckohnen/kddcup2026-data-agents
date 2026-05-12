@@ -28,6 +28,8 @@ class TaskRunArtifacts:
     trace_path: Path
     succeeded: bool
     failure_reason: str | None
+    input_tokens: int = 0
+    output_tokens: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -108,12 +110,15 @@ def _run_single_task_core(
     if task.difficulty != "easy":
         return _failure_run_result_payload(task_id, f"Skipping task with difficulty '{task.difficulty}' (only 'easy' tasks are supported).")
 
+    model_instance = model or build_model_adapter(config)
     agent = EasyTaskAgent(
-        model=model or build_model_adapter(config),
+        model=model_instance,
         max_steps=config.agent.max_steps,
     )
-    run_result = agent.run(task)
-    return run_result.to_dict()
+    run_result = agent.run(task).to_dict()
+    run_result["input_tokens"] = getattr(model_instance, "total_input_tokens", 0)
+    run_result["output_tokens"] = getattr(model_instance, "total_output_tokens", 0)
+    return run_result
 
 
 def _run_single_task_in_subprocess(task_id: str, config: AppConfig, queue: multiprocessing.Queue[Any]) -> None:
@@ -193,6 +198,8 @@ def _write_task_outputs(task_id: str, run_output_dir: Path, run_result: dict[str
         trace_path=trace_path,
         succeeded=bool(run_result.get("succeeded")),
         failure_reason=run_result.get("failure_reason"),
+        input_tokens=run_result.get("input_tokens", 0),
+        output_tokens=run_result.get("output_tokens", 0),
     )
 
 
@@ -259,12 +266,6 @@ def run_benchmark(
             task_artifacts.append(artifact)
             if progress_callback is not None:
                 progress_callback(artifact)
-        if hasattr(shared_model, "total_input_tokens"):
-            print(
-                f"\n[tokens] RUN TOTAL: in={shared_model.total_input_tokens} out={shared_model.total_output_tokens}"
-                f" | tasks={len(task_artifacts)} succeeded={sum(1 for a in task_artifacts if a.succeeded)}",
-                flush=True,
-            )
     else:
         with ThreadPoolExecutor(max_workers=effective_workers) as executor:
             future_to_index = {

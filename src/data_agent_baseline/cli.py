@@ -264,6 +264,9 @@ def run_benchmark_command(
     console.print(f"Run output: {run_output_dir}")
     console.print(f"Tasks attempted: {len(artifacts)}")
     console.print(f"Succeeded tasks: {sum(1 for item in artifacts if item.succeeded)}")
+    total_in = sum(a.input_tokens for a in artifacts)
+    total_out = sum(a.output_tokens for a in artifacts)
+    console.print(f"Tokens — input: {total_in:,}  output: {total_out:,}")
 
     # Step 3: evaluate predictions against gold files
     evaluation_dir = app_config.dataset.root_path.parent / "evaluation"

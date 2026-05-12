@@ -201,8 +201,19 @@ def build_context(database_name: str, raw_tables_input: list[dict]) -> dict[str,
     return context
 
 
-def build_schema_profile(context_dir: Path) -> dict[str, Any]:
-    from data_agent_baseline.tools.context_sqlite import load_raw_tables
+def build_schema_profile(context_dir: Path, sample_rows: int = 50000) -> dict[str, Any]:
+    from data_agent_baseline.tools.context_sqlite import load_raw_tables, load_context_to_sqlite
 
-    raw_tables = load_raw_tables(context_dir)
-    return build_context(context_dir.parent.name, raw_tables)
+    raw_tables = load_raw_tables(context_dir, max_rows=sample_rows)
+    result = build_context(context_dir.parent.name, raw_tables)
+
+    # Overwrite row_count with the true count from SQLite (sample may be capped).
+    conn = load_context_to_sqlite(context_dir)
+    for table_name in result["tables"]:
+        try:
+            actual = conn.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0]
+            result["tables"][table_name]["row_count"] = actual
+        except Exception:
+            pass
+
+    return result

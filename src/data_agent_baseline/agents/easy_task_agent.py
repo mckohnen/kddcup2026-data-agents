@@ -31,12 +31,16 @@ Step 2 — Resolve ambiguities (only if needed):
 Step 3 — Run SQL:
   Write SQL that answers the question directly from the schema. Rules:
   - Output only the columns explicitly requested in the question
+  - Never add LIMIT to the final answer query — return all rows that match the condition
   - JSON-sourced columns preserve native types (integers stay integers — no CAST needed)
   - CSV-sourced columns are stored as TEXT — use CAST(col AS INTEGER) for numeric comparisons
+  - Exploration queries (checking formats, sample values) may be incomplete due to row caps —
+    do not assume a sample represents all matching rows
 
 Step 4 — Validate:
   Check that row count is non-zero and no key columns are all NULL.
-  If the result looks wrong, revise the SQL and re-run.
+  If the result has fewer rows than the question implies, re-run without any LIMIT or ORDER BY
+  to confirm you have all matching rows.
 
 Step 5 — Submit:
   Call the answer tool with the final result table.

@@ -3,8 +3,12 @@ from __future__ import annotations
 import csv
 import json
 import sqlite3
+from itertools import islice
 from pathlib import Path
 from typing import Any
+
+# Per-process cache: built once per context_dir, reused across all queries in the same task.
+_conn_cache: dict[str, sqlite3.Connection] = {}
 
 
 def _sanitize(name: str) -> str:
@@ -66,7 +70,15 @@ def _load_csv_file(conn: sqlite3.Connection, path: Path) -> None:
 
 
 def load_context_to_sqlite(context_dir: Path) -> sqlite3.Connection:
-    """Load all JSON and CSV files from context into a fresh in-memory SQLite database."""
+    """Load all JSON and CSV files from context into an in-memory SQLite database.
+
+    The result is cached per context_dir for the lifetime of the process, so
+    repeated calls within the same task subprocess pay the loading cost only once.
+    """
+    key = str(context_dir.resolve())
+    if key in _conn_cache:
+        return _conn_cache[key]
+
     conn = sqlite3.connect(":memory:")
 
     for json_file in sorted(context_dir.rglob("*.json")):
@@ -81,11 +93,16 @@ def load_context_to_sqlite(context_dir: Path) -> sqlite3.Connection:
         except Exception:
             pass
 
+    _conn_cache[key] = conn
     return conn
 
 
-def load_raw_tables(context_dir: Path) -> list[dict[str, Any]]:
-    """Load all JSON and CSV files from context as raw record dicts (no SQLite)."""
+def load_raw_tables(context_dir: Path, max_rows: int | None = None) -> list[dict[str, Any]]:
+    """Load JSON, CSV, and SQLite files from context as raw record dicts.
+
+    max_rows caps the number of records per table (used by the schema profiler
+    to avoid reading millions of rows just for type inference).
+    """
     raw: list[dict[str, Any]] = []
 
     for json_file in sorted(context_dir.rglob("*.json")):
@@ -100,14 +117,17 @@ def load_raw_tables(context_dir: Path) -> list[dict[str, Any]]:
             else:
                 continue
             if records:
-                raw.append({"table": table_name, "records": records})
+                raw.append({
+                    "table": table_name,
+                    "records": records[:max_rows] if max_rows is not None else records,
+                })
         except Exception:
             pass
 
     for csv_file in sorted(context_dir.rglob("*.csv")):
         try:
             with csv_file.open(newline="", encoding="utf-8") as f:
-                records_str = list(csv.DictReader(f))
+                records_str = list(islice(csv.DictReader(f), max_rows))
             if records_str:
                 raw.append({"table": csv_file.stem, "records": records_str})
         except Exception:
@@ -123,7 +143,10 @@ def load_raw_tables(context_dir: Path) -> list[dict[str, Any]]:
                     "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
                 ).fetchall()
                 for (table_name,) in db_tables:
-                    rows = db_conn.execute(f'SELECT * FROM "{_sanitize(table_name)}"').fetchall()
+                    limit_clause = f" LIMIT {max_rows}" if max_rows is not None else ""
+                    rows = db_conn.execute(
+                        f'SELECT * FROM "{_sanitize(table_name)}"{limit_clause}'
+                    ).fetchall()
                     records_db: list[dict[str, Any]] = [dict(r) for r in rows]
                     if records_db:
                         raw.append({"table": table_name, "records": records_db})
