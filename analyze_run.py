@@ -155,7 +155,15 @@ def print_task_deep_dive(task_id: str, task_dir: Path, score_info: dict) -> None
                 print(f"  !! Tool error: {content}")
             elif action == "show_context_schema":
                 tables = content.get("tables", [])
-                print(f"  Schema: {len(tables)} tables — {[t['table'] for t in tables]}")
+                # New schema profiler returns a dict {table_name: profile};
+                # old format was a list of {"table": name, ...} dicts.
+                if isinstance(tables, dict):
+                    table_names = list(tables.keys())
+                else:
+                    table_names = [t["table"] for t in tables]
+                rels = content.get("relationships", [])
+                rel_info = f", {len(rels)} relationships" if rels else ""
+                print(f"  Schema: {len(table_names)} tables{rel_info} — {table_names}")
             elif action == "query_context_tables":
                 sql = step.get("action_input", {}).get("sql", "")
                 short_sql = sql[:200] + "..." if len(sql) > 200 else sql
