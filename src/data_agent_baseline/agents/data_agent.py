@@ -3,13 +3,12 @@ from __future__ import annotations
 from data_agent_baseline.agents.model import ModelAdapter
 from data_agent_baseline.agents.react import ReActAgent, ReActAgentConfig
 from data_agent_baseline.benchmark.schema import AnswerTable, PublicTask
-from data_agent_baseline.tools.context_sqlite import get_context_schema, run_sql_on_context
+from data_agent_baseline.tools.context_sqlite import run_sql_on_context
 from data_agent_baseline.tools.filesystem import (
+    _extract_md_section,
+    _extract_md_toc,
     list_context_tree,
-    read_csv_preview,
     read_doc_preview,
-    read_json_preview,
-    resolve_context_path,
 )
 from data_agent_baseline.tools.input_detector import detect_input_files
 from data_agent_baseline.tools.python_exec import execute_python_code
@@ -19,46 +18,89 @@ from data_agent_baseline.tools.registry import (
     ToolRegistry,
     ToolSpec,
 )
-from data_agent_baseline.tools.sqlite import execute_read_only_sql, inspect_sqlite_schema
+from data_agent_baseline.tools.schema_profiler import build_schema_profile
 
 DATA_AGENT_SYSTEM_PROMPT = """
-You are a data agent solving a data analysis task. Follow these steps:
+You are a data agent solving a data analysis task. Follow these steps carefully:
 
 Step 1 — Explore the context:
-  Use list_context to see all available files. Note the file types present.
+  Call list_context to see all available files and their sizes.
 
 Step 2 — Read documentation:
-  If a knowledge.md, README.md, or similar document exists, read it with read_doc first.
-  It may define column semantics, field encodings, and contain example queries.
+  Call read_doc for knowledge.md first. For knowledge.md, you will receive a table of
+  contents; then call read_doc again with 'section' set to the relevant header(s) to read
+  only what you need (e.g. '## 2. Core Entities & Fields').
+  Pay close attention to:
+  - Column semantics: a question may use a natural-language term (e.g. "ranked", "active",
+    "rate") — find the EXACT column that matches it. Multiple similar-sounding columns may
+    exist (e.g. "positionOrder" vs "rank", "points" vs "score") — read ALL relevant sections
+    in knowledge.md before choosing. Pick the column the documentation explicitly links to
+    the question's concept, not just the one with the most intuitive name.
+  - Value encodings: filters like label='+', status='Y', type='A' must match exactly.
+  - Example queries: replicate their logic, not just their structure.
+  For large doc/ files, call read_doc with the task question as context — relevant sections
+  will be surfaced automatically. For exhaustive extraction from large prose documents
+  (e.g. listing every entity with a certain label), use execute_python instead.
 
-Step 3 — Inspect data schemas:
-  - For CSV and JSON files: use show_context_schema to load them into in-memory SQLite
-    and inspect table names, columns, row counts, and sample values.
-  - For .db or .sqlite files: use inspect_sqlite_schema with the relative file path,
-    then sample rows with execute_context_sql to understand the data.
+Step 3 — Inspect schema:
+  Call show_context_schema to see all tables, columns, row counts, type hints, and inferred
+  relationships. ALL data sources are unified in one SQLite connection:
+  - CSV and JSON files → accessible as plain table names (e.g. SELECT * FROM atom)
+  - SQLite .db files   → accessible as <db_stem>.<table> (e.g. SELECT * FROM hero_power.hero_power)
+  You can JOIN across all sources in a single SQL query.
+  CRITICAL: Do NOT run "SELECT name FROM sqlite_master WHERE type='table'" or any query
+  against sqlite_master / sqlite_schema to discover tables. That system table only shows
+  the main (CSV/JSON) schema and will NOT list .db tables. Always trust show_context_schema
+  as the authoritative list of all available tables.
 
-Step 4 — Query and analyze:
-  - For CSV/JSON data (loaded into in-memory SQLite): use query_context_tables with SQL.
-    JSON-sourced columns preserve native types (no CAST needed for integers).
-    CSV-sourced columns are TEXT — use CAST(col AS INTEGER/REAL) for numeric comparisons.
-  - For .db/.sqlite files: use execute_context_sql with the relative file path and SQL.
-  - For complex multi-step analysis: use execute_python.
-    The context directory is the working directory. Standard libraries and pandas are available.
+Step 4 — Query and analyse:
+  Use query_context_tables with SQL for all data retrieval.
+  Important SQL rules:
+  - CSV columns are stored as TEXT — ALWAYS use CAST for numeric comparisons and arithmetic.
+    WRONG: WHERE height_cm > 200          (text comparison: '61' > '200' is TRUE!)
+    RIGHT:  WHERE CAST(height_cm AS INTEGER) > 200
+    This applies to every numeric filter or sort on CSV-sourced columns.
+  - JSON columns preserve native types (integers stay integers — no CAST needed).
+  - When ordering by a numeric ID suffix (e.g. atom_id like 'TR001_12'), always sort
+    numerically: ORDER BY CAST(SUBSTR(col, INSTR(col, '_') + 1) AS INTEGER)
+  - Never add LIMIT to the final answer query — return all matching rows.
+  For prose document extraction (e.g. extracting entity labels from a Markdown file),
+  use execute_python:
+    - Open the file by path under the context directory.
+    - Process it paragraph by paragraph (not sentence by sentence) to handle cases where
+      an entity ID and its classification appear in different sentences of the same paragraph.
+    - Print structured output (e.g. JSON list) to stdout; keep the script focused on a
+      single task. Do NOT mix SQLite connections into the same Python step as file reading.
 
-Step 5 — Validate:
-  Verify the result has non-zero rows and no key columns are entirely NULL.
-  Re-query with corrected logic if the result looks wrong.
+Step 5 — Validate before submitting:
+  Before calling answer, verify:
+  1. Row count is non-zero and no key columns are entirely NULL.
+  2. Column count matches the question: "how many" / "what is X" → 1 column;
+     "list X and Y" → 2 columns. Do NOT add extra columns (counts, IDs, labels) unless
+     the question explicitly asks for them.
+  3. Column names come directly from the source data. Never invent aliases or rename columns.
+  4. Result shape matches the question's intent:
+     - "how many" → 1 row, 1 column (a single count).
+     - "list / tally / enumerate [category values]" → one row per DISTINCT value, not one
+       row per source record. Use SELECT DISTINCT or GROUP BY to deduplicate before answering.
+     - "list [entities]" → one row per unique entity, not one row per relationship record.
 
 Step 6 — Submit:
-  Call answer with exactly the columns requested in the question.
-  Do not include columns that were not explicitly asked for.
+  Call answer with the final result table.
+
+Response format (mandatory):
+  Always respond with exactly one ```json block. Never add any text after the closing ```.
+  {
+    "thought": "<your reasoning>",
+    "action": "<tool_name>",
+    "action_input": {<parameters>}
+  }
 """.strip()
 
 
 # ---------------------------------------------------------------------------
 # Tool handlers
 # ---------------------------------------------------------------------------
-
 
 def _list_context(task: PublicTask, action_input: dict) -> ToolExecutionResult:
     max_depth = int(action_input.get("max_depth", 4))
@@ -68,25 +110,41 @@ def _list_context(task: PublicTask, action_input: dict) -> ToolExecutionResult:
 def _read_doc(task: PublicTask, action_input: dict) -> ToolExecutionResult:
     path = str(action_input["path"])
     max_chars = int(action_input.get("max_chars", 8000))
-    return ToolExecutionResult(ok=True, content=read_doc_preview(task, path, max_chars=max_chars))
+    section = action_input.get("section")
+    content = read_doc_preview(
+        task,
+        path,
+        max_chars=max_chars,
+        query=task.question,
+        section=section,
+    )
+    return ToolExecutionResult(ok=True, content=content)
 
 
-def _read_csv(task: PublicTask, action_input: dict) -> ToolExecutionResult:
-    path = str(action_input["path"])
-    max_rows = int(action_input.get("max_rows", 20))
-    return ToolExecutionResult(ok=True, content=read_csv_preview(task, path, max_rows=max_rows))
-
-
-def _read_json(task: PublicTask, action_input: dict) -> ToolExecutionResult:
-    path = str(action_input["path"])
-    max_chars = int(action_input.get("max_chars", 4000))
-    return ToolExecutionResult(ok=True, content=read_json_preview(task, path, max_chars=max_chars))
+def _read_knowledge_section(task: PublicTask, action_input: dict) -> ToolExecutionResult:
+    """Targeted section reader for knowledge.md — returns TOC if no section given."""
+    knowledge_path = task.context_dir / "knowledge.md"
+    if not knowledge_path.exists():
+        return ToolExecutionResult(ok=False, content={"error": "knowledge.md not found in context."})
+    text = knowledge_path.read_text(encoding="utf-8", errors="replace")
+    section = (action_input.get("section") or "").strip()
+    if not section:
+        toc = _extract_md_toc(text)
+        return ToolExecutionResult(ok=True, content={"sections": toc})
+    extracted = _extract_md_section(text, section)
+    if not extracted:
+        toc = _extract_md_toc(text)
+        return ToolExecutionResult(ok=True, content={
+            "error": f"Section '{section}' not found.",
+            "available_sections": toc,
+        })
+    return ToolExecutionResult(ok=True, content={"section": section, "content": extracted})
 
 
 def _show_context_schema(task: PublicTask, action_input: dict) -> ToolExecutionResult:
     del action_input
-    tables = get_context_schema(task.context_dir)
-    return ToolExecutionResult(ok=True, content={"tables": tables})
+    profile = build_schema_profile(task.context_dir)
+    return ToolExecutionResult(ok=True, content=profile)
 
 
 def _query_context_tables(task: PublicTask, action_input: dict) -> ToolExecutionResult:
@@ -94,18 +152,6 @@ def _query_context_tables(task: PublicTask, action_input: dict) -> ToolExecution
     limit = int(action_input.get("limit", 200))
     result = run_sql_on_context(task.context_dir, sql, limit=limit)
     return ToolExecutionResult(ok=True, content=result)
-
-
-def _inspect_sqlite_schema(task: PublicTask, action_input: dict) -> ToolExecutionResult:
-    path = resolve_context_path(task, str(action_input["path"]))
-    return ToolExecutionResult(ok=True, content=inspect_sqlite_schema(path))
-
-
-def _execute_context_sql(task: PublicTask, action_input: dict) -> ToolExecutionResult:
-    path = resolve_context_path(task, str(action_input["path"]))
-    sql = str(action_input["sql"])
-    limit = int(action_input.get("limit", 200))
-    return ToolExecutionResult(ok=True, content=execute_read_only_sql(path, sql, limit=limit))
 
 
 def _execute_python(task: PublicTask, action_input: dict) -> ToolExecutionResult:
@@ -141,121 +187,115 @@ def _answer(_: PublicTask, action_input: dict) -> ToolExecutionResult:
 
 
 # ---------------------------------------------------------------------------
-# Context-aware tool registry
+# Tool registry — unified, always the same set regardless of file types
 # ---------------------------------------------------------------------------
 
-_ALL_SPECS: dict[str, ToolSpec] = {
-    "answer": ToolSpec(
-        name="answer",
-        description="Submit the final answer table. This is the only valid terminating action.",
-        input_schema={"columns": ["col"], "rows": [["value"]]},
-    ),
+_TOOL_SPECS: dict[str, ToolSpec] = {
     "list_context": ToolSpec(
         name="list_context",
-        description="List all files and directories under the task context.",
+        description="List all files and directories under the task context directory.",
         input_schema={"max_depth": 4},
     ),
     "read_doc": ToolSpec(
         name="read_doc",
-        description="Read a text or markdown file from context (e.g. knowledge.md).",
-        input_schema={"path": "knowledge.md", "max_chars": 8000},
+        description=(
+            "Read a document from context. For knowledge.md, returns a table of contents "
+            "on the first call; pass 'section' to read a specific ## header block. "
+            "For large doc/ files, returns the most query-relevant chunks automatically. "
+            "Use execute_python for exhaustive extraction of all entities in large prose files."
+        ),
+        input_schema={"path": "knowledge.md", "section": "## 2. Core Entities & Fields"},
     ),
-    "read_csv": ToolSpec(
-        name="read_csv",
-        description="Preview a CSV file from context (returns header + sample rows).",
-        input_schema={"path": "relative/path.csv", "max_rows": 20},
-    ),
-    "read_json": ToolSpec(
-        name="read_json",
-        description="Preview a JSON file from context.",
-        input_schema={"path": "relative/path.json", "max_chars": 4000},
+    "read_knowledge_section": ToolSpec(
+        name="read_knowledge_section",
+        description=(
+            "Read a specific ## section from knowledge.md by its exact header text. "
+            "Omit 'section' to get the table of contents. "
+            "Use this for targeted lookups: column meanings, encodings, example queries."
+        ),
+        input_schema={"section": "## 2. Core Entities & Fields"},
     ),
     "show_context_schema": ToolSpec(
         name="show_context_schema",
         description=(
-            "Load all CSV and JSON context files into in-memory SQLite and return "
-            "table names, columns, row counts, and sample rows."
+            "Return a rich schema profile for all tables in the unified SQLite connection: "
+            "CSV/JSON tables (plain names) and SQLite .db tables (<db_stem>.<table>). "
+            "Includes column types, null counts, sample values, and inferred relationships."
         ),
         input_schema={},
     ),
     "query_context_tables": ToolSpec(
         name="query_context_tables",
         description=(
-            "Run SQL on in-memory SQLite containing all CSV/JSON context files. "
-            "JSON columns keep native types; CSV columns are TEXT (CAST for numerics)."
+            "Run SQL on the unified in-memory SQLite containing ALL context data. "
+            "CSV/JSON tables use plain names; .db tables use <db_stem>.<table> prefix. "
+            "IMPORTANT: CSV columns are stored as TEXT. Always CAST for numeric comparisons: "
+            "  WRONG: WHERE height_cm > 200  (text: '61'>'200' is TRUE!) "
+            "  RIGHT:  WHERE CAST(height_cm AS INTEGER) > 200 "
+            "JSON columns keep native types (no CAST needed). "
+            "Do NOT use sqlite_master to list tables — it only shows CSV/JSON tables. "
+            "JOINs across CSV, JSON, and .db sources work in a single query."
         ),
         input_schema={"sql": "SELECT ...", "limit": 200},
-    ),
-    "inspect_sqlite_schema": ToolSpec(
-        name="inspect_sqlite_schema",
-        description="Inspect tables and column definitions in a .db or .sqlite file in context.",
-        input_schema={"path": "relative/path.sqlite"},
-    ),
-    "execute_context_sql": ToolSpec(
-        name="execute_context_sql",
-        description="Run a read-only SQL query against a .db or .sqlite file in context.",
-        input_schema={"path": "relative/path.sqlite", "sql": "SELECT ...", "limit": 200},
     ),
     "execute_python": ToolSpec(
         name="execute_python",
         description=(
             f"Execute Python code with the context directory as working directory. "
-            f"Standard libraries and pandas are available. Returns stdout as output. "
+            f"Use for: (1) exhaustive extraction from large prose Markdown documents "
+            f"(read the full file, split by paragraph, extract structured data, print as JSON); "
+            f"(2) multi-step computation not easily expressed in SQL. "
+            f"Standard libraries and pandas are available. "
+            f"Do NOT open SQLite connections inside Python — use query_context_tables instead. "
             f"Timeout: {EXECUTE_PYTHON_TIMEOUT_SECONDS}s."
         ),
         input_schema={"code": "import os\nprint(sorted(os.listdir('.')))"},
     ),
+    "answer": ToolSpec(
+        name="answer",
+        description=(
+            "Submit the final answer table. This is the only valid terminating action. "
+            "columns must be the exact source column names. "
+            "Only include columns explicitly requested in the question."
+        ),
+        input_schema={"columns": ["col"], "rows": [["value"]]},
+    ),
 }
 
-_ALL_HANDLERS = {
-    "answer": _answer,
+_TOOL_HANDLERS = {
     "list_context": _list_context,
     "read_doc": _read_doc,
-    "read_csv": _read_csv,
-    "read_json": _read_json,
+    "read_knowledge_section": _read_knowledge_section,
     "show_context_schema": _show_context_schema,
     "query_context_tables": _query_context_tables,
-    "inspect_sqlite_schema": _inspect_sqlite_schema,
-    "execute_context_sql": _execute_context_sql,
     "execute_python": _execute_python,
+    "answer": _answer,
 }
 
 
-def create_data_agent_tool_registry(input_files: dict) -> ToolRegistry:
-    """Build a tool registry tailored to the file types present in the task context."""
-    has_tabular = bool(input_files.get("csv") or input_files.get("json"))
-    has_db = bool(input_files.get("db"))
+def create_data_agent_tool_registry(input_files: dict | None = None) -> ToolRegistry:
+    """Return the unified tool registry.
 
-    active: set[str] = {"answer", "list_context", "read_doc", "execute_python"}
-
-    if has_tabular or not has_db:
-        active.update({"show_context_schema", "query_context_tables"})
-
-    if has_db:
-        active.update({"inspect_sqlite_schema", "execute_context_sql"})
-
-    if not has_tabular and not has_db:
-        # Unknown context — add raw file readers for exploration
-        active.update({"read_csv", "read_json"})
-
-    return ToolRegistry(
-        specs={k: v for k, v in _ALL_SPECS.items() if k in active},
-        handlers={k: v for k, v in _ALL_HANDLERS.items() if k in active},
-    )
+    All tools are always active — the unified SQLite handles CSV, JSON, and .db
+    sources transparently, so no per-file-type routing is needed.
+    The ``input_files`` parameter is kept for backwards compatibility but ignored.
+    """
+    del input_files  # no longer used
+    return ToolRegistry(specs=_TOOL_SPECS, handlers=_TOOL_HANDLERS)
 
 
 # ---------------------------------------------------------------------------
 # DataAgent
 # ---------------------------------------------------------------------------
 
-
 class DataAgent:
     """
     General-purpose data agent that handles tasks of any difficulty.
 
-    Tool selection adapts automatically based on the file types detected in the
-    task's context directory (CSV/JSON → in-memory SQLite; .db → real SQLite;
-    mixed → both; always includes Python execution as a fallback).
+    All data sources (CSV, JSON, SQLite .db files) are unified in a single
+    in-memory SQLite connection so the agent can JOIN across them without any
+    tool switching. Tool selection is fixed regardless of which file types are
+    present in the context.
     """
 
     def __init__(self, *, model: ModelAdapter, max_steps: int = 16) -> None:
@@ -263,8 +303,7 @@ class DataAgent:
         self.max_steps = max_steps
 
     def run(self, task: PublicTask):
-        input_files = detect_input_files(task)
-        tools = create_data_agent_tool_registry(input_files)
+        tools = create_data_agent_tool_registry()
         agent = ReActAgent(
             model=self.model,
             tools=tools,

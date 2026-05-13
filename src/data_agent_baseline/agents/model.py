@@ -39,6 +39,8 @@ class OpenAIModelAdapter:
         self.api_base = api_base.rstrip("/")
         self.api_key = api_key
         self.temperature = temperature
+        self.total_input_tokens: int = 0
+        self.total_output_tokens: int = 0
 
     def complete(self, messages: list[ModelMessage]) -> str:
         if not self.api_key:
@@ -65,6 +67,11 @@ class OpenAIModelAdapter:
         content = choices[0].message.content
         if not isinstance(content, str):
             raise RuntimeError("Model response missing text content.")
+
+        if response.usage:
+            self.total_input_tokens += response.usage.prompt_tokens
+            self.total_output_tokens += response.usage.completion_tokens
+
         return content
 
 

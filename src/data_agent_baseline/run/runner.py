@@ -27,6 +27,8 @@ class TaskRunArtifacts:
     trace_path: Path
     succeeded: bool
     failure_reason: str | None
+    input_tokens: int = 0
+    output_tokens: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -36,6 +38,8 @@ class TaskRunArtifacts:
             "trace_path": str(self.trace_path),
             "succeeded": self.succeeded,
             "failure_reason": self.failure_reason,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
         }
 
 
@@ -104,12 +108,15 @@ def _run_single_task_core(
     public_dataset = DABenchPublicDataset(config.dataset.root_path)
     task = public_dataset.get_task(task_id)
 
+    model_instance = model or build_model_adapter(config)
     agent = DataAgent(
-        model=model or build_model_adapter(config),
+        model=model_instance,
         max_steps=config.agent.max_steps,
     )
-    run_result = agent.run(task)
-    return run_result.to_dict()
+    run_result = agent.run(task).to_dict()
+    run_result["input_tokens"] = getattr(model_instance, "total_input_tokens", 0)
+    run_result["output_tokens"] = getattr(model_instance, "total_output_tokens", 0)
+    return run_result
 
 
 def _run_single_task_in_subprocess(task_id: str, config: AppConfig, queue: multiprocessing.Queue[Any]) -> None:
@@ -134,8 +141,9 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
     if timeout_seconds <= 0:
         return _run_single_task_core(task_id=task_id, config=config)
 
-    queue: multiprocessing.Queue[Any] = multiprocessing.Queue()
-    process = multiprocessing.Process(
+    ctx = multiprocessing.get_context("spawn")
+    queue: multiprocessing.Queue[Any] = ctx.Queue()
+    process = ctx.Process(
         target=_run_single_task_in_subprocess,
         args=(task_id, config, queue),
     )
@@ -188,6 +196,8 @@ def _write_task_outputs(task_id: str, run_output_dir: Path, run_result: dict[str
         trace_path=trace_path,
         succeeded=bool(run_result.get("succeeded")),
         failure_reason=run_result.get("failure_reason"),
+        input_tokens=run_result.get("input_tokens", 0),
+        output_tokens=run_result.get("output_tokens", 0),
     )
 
 

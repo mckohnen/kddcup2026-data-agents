@@ -15,6 +15,15 @@ from data_agent_baseline.agents.runtime import AgentRunResult, AgentRuntimeState
 from data_agent_baseline.benchmark.schema import PublicTask
 from data_agent_baseline.tools.registry import ToolRegistry
 
+_RECOVERY_HINT = (
+    "Your previous response could not be parsed as a valid JSON action. "
+    "You MUST respond with exactly one ```json block containing a single JSON object:\n"
+    "```json\n"
+    '{\"thought\": \"<your reasoning>\", \"action\": \"<tool_name>\", \"action_input\": {...}}\n'
+    "```\n"
+    "Do not add any text before or after the code block."
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ReActAgentConfig:
@@ -42,6 +51,27 @@ def _load_single_json_object(text: str) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise ValueError("Model response must be a JSON object.")
     return payload
+
+
+def _try_repair_json(raw_response: str) -> str | None:
+    """Attempt lightweight repair of common LLM JSON formatting errors.
+
+    Handles the most frequent case: trailing commas before } or ].
+    Returns a repaired string on success, or None if the response is
+    unrecoverable.
+    """
+    text = _strip_json_fence(raw_response)
+
+    # Remove trailing commas before closing braces / brackets
+    cleaned = re.sub(r",(\s*[}\]])", r"\1", text)
+
+    try:
+        _load_single_json_object(cleaned)
+        return cleaned
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    return None
 
 
 def parse_model_step(raw_response: str) -> ModelStep:
@@ -89,9 +119,14 @@ class ReActAgent:
         messages.append(ModelMessage(role="user", content=build_task_prompt(task)))
         for step in state.steps:
             messages.append(ModelMessage(role="assistant", content=step.raw_response))
-            messages.append(
-                ModelMessage(role="user", content=build_observation_prompt(step.observation))
-            )
+            if step.action == "__error__":
+                # Replace the generic error observation with an explicit recovery hint
+                # so the model knows exactly how to fix its output format.
+                messages.append(ModelMessage(role="user", content=_RECOVERY_HINT))
+            else:
+                messages.append(
+                    ModelMessage(role="user", content=build_observation_prompt(step.observation))
+                )
         return messages
 
     def run(self, task: PublicTask) -> AgentRunResult:
@@ -120,6 +155,38 @@ class ReActAgent:
                     state.answer = tool_result.answer
                     break
             except Exception as exc:
+                # Layer 1: attempt silent JSON repair before recording the error.
+                repaired = _try_repair_json(raw_response)
+                if repaired is not None:
+                    try:
+                        model_step = parse_model_step(repaired)
+                        tool_result = self.tools.execute(
+                            task, model_step.action, model_step.action_input
+                        )
+                        observation = {
+                            "ok": tool_result.ok,
+                            "tool": model_step.action,
+                            "content": tool_result.content,
+                        }
+                        step_record = StepRecord(
+                            step_index=step_index,
+                            thought=model_step.thought,
+                            action=model_step.action,
+                            action_input=model_step.action_input,
+                            raw_response=repaired,
+                            observation=observation,
+                            ok=tool_result.ok,
+                        )
+                        state.steps.append(step_record)
+                        if tool_result.is_terminal:
+                            state.answer = tool_result.answer
+                            break
+                        continue
+                    except Exception:
+                        pass  # Repair succeeded but tool failed — fall through to error record
+
+                # Layer 2: record the error; _build_messages will inject the recovery hint
+                # as the next user message so the model knows exactly what went wrong.
                 observation = {
                     "ok": False,
                     "error": str(exc),
