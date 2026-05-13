@@ -215,8 +215,9 @@ def main() -> None:
         try:
             sys.path.insert(0, str(Path(__file__).parent / "src"))
             from data_agent_baseline.run.evaluate import evaluate_run, write_evaluation_report
-            evaluation = evaluate_run(run_dir, args.eval_dir)
-            write_evaluation_report(run_dir, evaluation)
+            eval_result = evaluate_run(run_dir, args.eval_dir)
+            write_evaluation_report(eval_result, run_dir)
+            evaluation = eval_result.to_dict()
             print(f"(Evaluation computed and saved to {eval_path})")
         except Exception as exc:
             print(f"Warning: could not compute evaluation: {exc}", file=sys.stderr)
