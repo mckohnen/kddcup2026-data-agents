@@ -19,6 +19,7 @@ from data_agent_baseline.tools.registry import (
     ToolSpec,
 )
 from data_agent_baseline.tools.schema_profiler import build_schema_profile
+from data_agent_baseline.tools.task_analyzer import build_task_analysis, format_task_analysis_hint
 
 DATA_AGENT_SYSTEM_PROMPT = """
 You are a data agent solving a data analysis task. Follow these steps carefully:
@@ -81,8 +82,10 @@ Step 5 — Validate before submitting:
   3. Column names come directly from the source data. Never invent aliases or rename columns.
   4. Result shape matches the question's intent:
      - "how many" → 1 row, 1 column (a single count).
-     - "list / tally / enumerate [category values]" → one row per DISTINCT value, not one
-       row per source record. Use SELECT DISTINCT or GROUP BY to deduplicate before answering.
+     - "list / tally / enumerate [values or entities]" → one row per DISTINCT value; use
+       SELECT DISTINCT or GROUP BY to deduplicate. Output ONLY the values themselves —
+       never add a count/frequency column alongside them unless the question explicitly
+       uses words like "count", "how many", "how often", "number of", or "frequency".
      - "list [entities]" → one row per unique entity, not one row per relationship record.
 
 Step 6 — Submit:
@@ -149,6 +152,21 @@ def _show_context_schema(task: PublicTask, action_input: dict) -> ToolExecutionR
 
 def _query_context_tables(task: PublicTask, action_input: dict) -> ToolExecutionResult:
     sql = str(action_input["sql"])
+    # Block sqlite_master / sqlite_schema queries — they only expose the main schema
+    # and silently omit all ATTACH'd .db tables, causing the agent to loop in confusion.
+    sql_compact = sql.upper().replace(" ", "").replace("\n", "")
+    if "SQLITE_MASTER" in sql_compact or "SQLITE_SCHEMA" in sql_compact:
+        return ToolExecutionResult(
+            ok=False,
+            content={
+                "error": (
+                    "Querying sqlite_master or sqlite_schema is not allowed. "
+                    "Those system tables only list main-schema tables and will miss "
+                    "all .db tables loaded via ATTACH. "
+                    "Call show_context_schema to get the complete authoritative table list."
+                )
+            },
+        )
     limit = int(action_input.get("limit", 200))
     result = run_sql_on_context(task.context_dir, sql, limit=limit)
     return ToolExecutionResult(ok=True, content=result)
@@ -304,10 +322,27 @@ class DataAgent:
 
     def run(self, task: PublicTask):
         tools = create_data_agent_tool_registry()
+
+        # Pre-flight: analyse the question against the schema and raw data.
+        # The resulting hint is injected into the first user message so the
+        # agent starts with candidate tables, columns, literal filters, and
+        # join paths already identified.  The structured analysis is also
+        # passed to the critic for column-level disambiguation.
+        task_hint: str | None = None
+        task_analysis: dict = {}
+        try:
+            schema = build_schema_profile(task.context_dir)
+            task_analysis = build_task_analysis(task.question, schema, task.context_dir)
+            task_hint = format_task_analysis_hint(task_analysis)
+        except Exception:
+            pass  # Never let analysis failure block the agent run
+
         agent = ReActAgent(
             model=self.model,
             tools=tools,
             config=ReActAgentConfig(max_steps=self.max_steps),
             system_prompt=DATA_AGENT_SYSTEM_PROMPT,
+            task_hint=task_hint,
+            task_analysis=task_analysis,
         )
         return agent.run(task)

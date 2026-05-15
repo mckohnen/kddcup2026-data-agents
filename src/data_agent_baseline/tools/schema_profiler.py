@@ -154,6 +154,37 @@ def _relationship_name_score(from_col: str, to_table: str, to_col: str) -> float
     return score
 
 
+def _is_plausible_fk(from_col: str, to_table: str) -> bool:
+    """Check whether a candidate FK relationship is plausible by name.
+
+    High value-overlap between two columns can occur purely by coincidence when
+    both use small integer IDs (e.g. superhero.alignment_id and superpower.id
+    both use IDs 1-10).  This name-based gate requires that the column and target
+    table have some lexical relationship before we accept the link.
+
+    Rules (any one suffices):
+    - Explicit link_to_<table> pattern (e.g. link_to_member → member)
+    - Column is <prefix>_id and prefix appears in (or equals) the target table name
+    - Target table name appears as a substring in the column name
+    """
+    fn = from_col.lower()
+    # Use the base table name (strip alias prefix for alias.table format)
+    tt = to_table.lower().split(".")[-1]
+
+    if fn == f"link_to_{tt}":
+        return True
+
+    if fn.endswith("_id"):
+        prefix = fn[:-3]  # strip "_id" suffix
+        if len(prefix) >= 3 and (prefix in tt or tt.startswith(prefix)):
+            return True
+
+    if tt in fn:
+        return True
+
+    return False
+
+
 def _detect_relationships(raw_tables: dict, context: dict) -> list[dict]:
     relationships: list[dict] = []
     reference_columns = _get_reference_columns(raw_tables, context)
@@ -162,6 +193,9 @@ def _detect_relationships(raw_tables: dict, context: dict) -> list[dict]:
         for from_col, from_col_ctx in context["tables"][from_table]["columns"].items():
             if not is_id_like(from_col) or from_col_ctx.get("role") == "primary_key":
                 continue
+            # Name-plausibility gate: only consider this column as a FK candidate
+            # if its name suggests it references the target table.  This prevents
+            # false positives when unrelated columns happen to share integer ranges.
             values = [
                 str(normalize_null(row.get(from_col)))
                 for row in records
@@ -172,6 +206,9 @@ def _detect_relationships(raw_tables: dict, context: dict) -> list[dict]:
             for ref in reference_columns:
                 to_table, to_col, ref_values = ref["table"], ref["column"], ref["values"]
                 if from_table == to_table:
+                    continue
+                # Skip if the column name gives no lexical signal for this target
+                if not _is_plausible_fk(from_col, to_table):
                     continue
                 coverage = sum(v in ref_values for v in values) / len(values)
                 if coverage >= 0.80:
