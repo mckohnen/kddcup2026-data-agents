@@ -152,7 +152,9 @@ def print_task_deep_dive(task_id: str, task_dir: Path, score_info: dict) -> None
             content = obs.get("content", {})
             obs_ok = obs.get("ok", True)
             if not obs_ok:
-                print(f"  !! Tool error: {content}")
+                # Prefer explicit error message; fall back to content
+                err_detail = obs.get("error") or content
+                print(f"  !! Tool error: {err_detail}")
             elif action == "show_context_schema":
                 tables = content.get("tables", [])
                 # New schema profiler returns a dict {table_name: profile};
@@ -180,14 +182,17 @@ def print_task_deep_dive(task_id: str, task_dir: Path, score_info: dict) -> None
                 length = len(str(content))
                 print(f"  Doc content: {length} chars")
             elif action == "execute_python":
-                out = content.get("stdout", "")[:200]
+                # Key is "output" (not "stdout") in execute_python results
+                out = (content.get("output") or content.get("stdout", ""))[:200]
                 err = content.get("stderr", "")[:200]
                 if out:
                     print(f"  stdout: {out}")
                 if err:
                     print(f"  stderr: {err}")
             elif action == "__error__":
-                print(f"  Parse error: {content}")
+                # For __error__ steps the error lives in obs["error"], not obs["content"]
+                err_msg = obs.get("error") or content
+                print(f"  Parse error: {err_msg}")
             else:
                 short_content = str(content)[:300]
                 print(f"  Content: {short_content}")
