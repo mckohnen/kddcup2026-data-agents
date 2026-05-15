@@ -166,3 +166,4 @@ docker run --rm \
 - **12-hour total wall-clock limit** across all tasks. Per-task timeout in config is 600 s.
 - **Scoring:** column-level matching, `Score = Recall − λ × (ExtraColumns / PredictedColumns)`. Extra columns hurt — only output what the question asks for.
 - The model name injected is always `qwen3.5-35b-a3b`; do not hard-code any other model name in submission code.
+- Never modify any of the original input files, including the knowledge.md files.
