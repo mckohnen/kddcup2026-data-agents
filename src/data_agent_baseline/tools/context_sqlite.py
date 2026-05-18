@@ -100,7 +100,7 @@ def load_context_to_sqlite(context_dir: Path) -> sqlite3.Connection:
     if key in _conn_cache:
         return _conn_cache[key]
 
-    conn = sqlite3.connect(":memory:")
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
 
     for json_file in sorted(context_dir.rglob("*.json")):
         try:
