@@ -5,13 +5,45 @@ agent:
   model: YOUR_MODEL_NAME
   api_base: YOUR_API_BASE_URL
   api_key: YOUR_API_KEY
-  max_steps: 16                        # max ReAct loop iterations per task
+  max_steps: 16                        # max ReAct loop iterations per attempt
   temperature: 0.0
 
 run:
   output_dir: artifacts/runs
   run_id: example_run_id              # unique identifier; bump for each new run
   max_workers: 4                       # parallel task workers
-  task_timeout_seconds: 900            # wall-clock limit per task (seconds)
-  preflight_timeout_seconds: 600        # budget for schema pre-analysis before the ReAct loop
-  max_resumptions: 2                   # how many times a timed-out task may be resumed
+
+  preflight_timeout_seconds: 30        # budget for schema pre-analysis (first attempt only)
+
+  # --- Timeout strategy ---
+  # task_timeout_seconds_per_attempt defines the wall-clock budget per attempt.
+  # Length of the list = total number of attempts (first + resumptions).
+  # Each attempt runs in its own subprocess; budgets escalate so fast tasks
+  # fail quickly and only hard tasks spend their full allotment.
+  #
+  # If omitted, falls back to:
+  #   task_timeout_seconds: 600
+  #   max_resumptions: 0
+  # which gives a flat single-attempt budget (backward-compatible).
+  #
+  # Competition-safe presets (see CLAUDE.md for the math):
+  #
+  #   Fast iteration / imperfect subset:
+  #     task_timeout_seconds_per_attempt: [250, 500]
+  #     # max per task: 30 + 250 + 500 = 780 s
+  #
+  #   A-board submission (2 h total, 57 tasks, 4 workers — worst-case safe):
+  #     task_timeout_seconds_per_attempt: [200, 450]
+  #     # max per task: 30 + 200 + 450 = 680 s → 15 waves × 680 s / 3600 = 2.8 h worst case
+  #     # if ≥ 30 % of tasks finish on attempt 1: ≈ 1.8 h  (within 2 h limit)
+  #
+  #   B-board submission (12 h total, 324 tasks, 4 workers — worst-case safe):
+  #     task_timeout_seconds_per_attempt: [250, 500]
+  #     # max per task: 780 s → 81 waves × 780 s / 3600 = 17.6 h worst case
+  #     # if ≥ 30 % finish on attempt 1: ≈ 11.5 h  (within 12 h limit)
+  #
+  task_timeout_seconds_per_attempt: [250, 500]
+
+  # Legacy flat-timeout fields (used only when task_timeout_seconds_per_attempt is absent):
+  # task_timeout_seconds: 600
+  # max_resumptions: 0

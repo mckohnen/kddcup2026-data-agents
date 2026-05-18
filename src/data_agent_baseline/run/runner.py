@@ -98,6 +98,56 @@ def _failure_run_result_payload(task_id: str, failure_reason: str) -> dict[str, 
     }
 
 
+def _resolve_attempt_timeouts(run_config) -> list[int]:
+    """Return per-attempt wall-clock budgets (seconds), excluding preflight.
+
+    If ``task_timeout_seconds_per_attempt`` is set in config it is used directly
+    (length determines the total number of attempts).  Otherwise the flat
+    ``task_timeout_seconds`` value is repeated ``1 + max_resumptions`` times for
+    backward compatibility.
+    """
+    if run_config.task_timeout_seconds_per_attempt:
+        return list(run_config.task_timeout_seconds_per_attempt)
+    return [run_config.task_timeout_seconds] * (1 + max(0, run_config.max_resumptions))
+
+
+def _run_one_attempt_core(
+    *,
+    task_id: str,
+    config: AppConfig,
+    prior_summaries: list[str] | None = None,
+    is_first_attempt: bool = True,
+    model=None,
+    tools: ToolRegistry | None = None,
+) -> dict[str, Any]:
+    """Run a SINGLE agent attempt (no internal resumption loop).
+
+    Returns the attempt result dict including ``preflight``, ``input_tokens``,
+    and ``output_tokens`` keys that the caller may pop before writing the trace.
+    """
+    public_dataset = DABenchPublicDataset(config.dataset.root_path)
+    task = public_dataset.get_task(task_id)
+
+    model_instance = model or build_model_adapter(config)
+
+    # Only run preflight on the first attempt.  Resumptions already receive the
+    # schema via the prior_summaries block, so re-running preflight wastes budget.
+    preflight_secs = config.run.preflight_timeout_seconds if is_first_attempt else 0
+    agent = DataAgent(
+        model=model_instance,
+        max_steps=config.agent.max_steps,
+        preflight_timeout_seconds=preflight_secs,
+    )
+
+    run_result = agent.run(task, prior_attempts=prior_summaries or []).to_dict()
+
+    # Attach per-attempt metadata for the caller to accumulate / write.
+    run_result["preflight"] = getattr(agent, "_last_preflight", {})
+    run_result["input_tokens"] = getattr(model_instance, "total_input_tokens", 0)
+    run_result["output_tokens"] = getattr(model_instance, "total_output_tokens", 0)
+    return run_result
+
+
 def _run_single_task_core(
     *,
     task_id: str,
@@ -105,109 +155,177 @@ def _run_single_task_core(
     model=None,
     tools: ToolRegistry | None = None,
 ) -> dict[str, Any]:
-    public_dataset = DABenchPublicDataset(config.dataset.root_path)
-    task = public_dataset.get_task(task_id)
+    """Run all attempts in-process (used when model/tools overrides are provided).
 
-    model_instance = model or build_model_adapter(config)
-    agent = DataAgent(
-        model=model_instance,
-        max_steps=config.agent.max_steps,
-        preflight_timeout_seconds=config.run.preflight_timeout_seconds,
-    )
-
-    # --- First attempt ---
-    run_result = agent.run(task).to_dict()
-
-    # --- Resumption loop ---
-    # If the agent ran out of steps without submitting an answer, retry up to
-    # max_resumptions times.  Each retry receives a compact summary of all prior
-    # attempts so it can skip already-explored paths.
-    max_resumptions = config.run.max_resumptions
+    This path is only taken in single-worker / test mode.  Production runs go
+    through ``_run_single_task_with_timeout`` which spawns a subprocess per attempt.
+    """
+    attempt_timeouts = _resolve_attempt_timeouts(config.run)
     prior_summaries: list[str] = []
+    cumulative_input = 0
+    cumulative_output = 0
+    preflight_saved = False
+    run_result: dict[str, Any] = _failure_run_result_payload(task_id, "No attempts were made.")
 
-    for _resumption_round in range(max_resumptions):
-        # Only resume when the attempt exhausted max_steps without answering.
+    for attempt_idx in range(len(attempt_timeouts)):
+        run_result = _run_one_attempt_core(
+            task_id=task_id,
+            config=config,
+            prior_summaries=prior_summaries,
+            is_first_attempt=(attempt_idx == 0),
+            model=model,
+            tools=tools,
+        )
+        cumulative_input += run_result.pop("input_tokens", 0)
+        cumulative_output += run_result.pop("output_tokens", 0)
+        if not preflight_saved:
+            run_result.setdefault("preflight", {})
+            preflight_saved = True
+        else:
+            run_result.pop("preflight", None)
+
         if run_result.get("answer") is not None:
-            break  # Got an answer — no resumption needed.
+            break
         failure_reason = run_result.get("failure_reason", "")
         if "max_steps" not in failure_reason.lower():
-            break  # Failure was not step-exhaustion (e.g. crash) — don't retry.
+            break
+        if attempt_idx < len(attempt_timeouts) - 1:
+            prior_summaries.append(summarise_trace_for_resumption(run_result))
 
-        # Summarise the trace and re-run with accumulated prior context.
-        prior_summaries.append(summarise_trace_for_resumption(run_result))
-        run_result = agent.run(task, prior_attempts=prior_summaries).to_dict()
-
-    # Token counts on the model adapter are cumulative across all attempts.
-    run_result["input_tokens"] = getattr(model_instance, "total_input_tokens", 0)
-    run_result["output_tokens"] = getattr(model_instance, "total_output_tokens", 0)
+    run_result["input_tokens"] = cumulative_input
+    run_result["output_tokens"] = cumulative_output
     return run_result
 
 
-def _run_single_task_in_subprocess(task_id: str, config: AppConfig, queue: multiprocessing.Queue[Any]) -> None:
+def _run_one_attempt_in_subprocess(
+    task_id: str,
+    config: AppConfig,
+    prior_summaries: list[str],
+    attempt_idx: int,
+    queue: multiprocessing.Queue[Any],
+) -> None:
     try:
         queue.put(
             {
                 "ok": True,
-                "run_result": _run_single_task_core(task_id=task_id, config=config),
+                "run_result": _run_one_attempt_core(
+                    task_id=task_id,
+                    config=config,
+                    prior_summaries=prior_summaries,
+                    is_first_attempt=(attempt_idx == 0),
+                ),
             }
         )
     except BaseException as exc:  # noqa: BLE001
-        queue.put(
-            {
-                "ok": False,
-                "error": str(exc),
-            }
-        )
+        queue.put({"ok": False, "error": str(exc)})
 
 
 def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[str, Any]:
-    agent_timeout = config.run.task_timeout_seconds
-    if agent_timeout <= 0:
-        return _run_single_task_core(task_id=task_id, config=config)
+    """Run a task with per-attempt escalating wall-clock timeouts.
 
-    # The outer wall-clock budget covers pre-flight AND agent work.
-    # Pre-flight runs in its own thread (capped by preflight_timeout_seconds) inside
-    # the subprocess, so we must give the subprocess enough time for both phases.
-    # On top of that, add headroom per resumption round so retries don't get cut off.
+    Each attempt runs in its own subprocess so the timeout is enforced reliably.
+    The preflight budget is added on top of the first attempt's agent budget only.
+
+    Resumptions are only triggered when an attempt exhausted ``max_steps`` — a
+    timeout or crash is not retried (the subprocess was already killed / gave up).
+    """
+    attempt_timeouts = _resolve_attempt_timeouts(config.run)
     preflight_budget = config.run.preflight_timeout_seconds
-    resumption_rounds = max(0, config.run.max_resumptions)
-    timeout_seconds = preflight_budget + agent_timeout * (1 + resumption_rounds)
 
-    ctx = multiprocessing.get_context("spawn")
-    queue: multiprocessing.Queue[Any] = ctx.Queue()
-    process = ctx.Process(
-        target=_run_single_task_in_subprocess,
-        args=(task_id, config, queue),
-    )
-    process.start()
-    process.join(timeout_seconds)
+    prior_summaries: list[str] = []
+    cumulative_input = 0
+    cumulative_output = 0
+    preflight_result: dict = {}
+    last_result: dict[str, Any] = _failure_run_result_payload(task_id, "No attempts were made.")
 
-    if process.is_alive():
-        process.terminate()
-        process.join(timeout=1.0)
+    for attempt_idx, attempt_timeout in enumerate(attempt_timeouts):
+        # First attempt: add preflight budget.  Resumptions skip preflight.
+        subprocess_budget = attempt_timeout + (preflight_budget if attempt_idx == 0 else 0)
+
+        ctx = multiprocessing.get_context("spawn")
+        queue: multiprocessing.Queue[Any] = ctx.Queue()
+        process = ctx.Process(
+            target=_run_one_attempt_in_subprocess,
+            args=(task_id, config, prior_summaries, attempt_idx, queue),
+        )
+        process.start()
+        process.join(subprocess_budget)
+
         if process.is_alive():
-            process.kill()
-            process.join()
-        return _failure_run_result_payload(task_id, f"Task timed out after {timeout_seconds} seconds.")
-
-    if queue.empty():
-        exit_code = process.exitcode
-        if exit_code not in (None, 0):
-            return _failure_run_result_payload(
+            process.terminate()
+            process.join(timeout=1.0)
+            if process.is_alive():
+                process.kill()
+                process.join()
+            run_result = _failure_run_result_payload(
                 task_id,
-                f"Task exited unexpectedly with exit code {exit_code}.",
+                f"Attempt {attempt_idx + 1} timed out after {subprocess_budget}s.",
             )
-        return _failure_run_result_payload(task_id, "Task exited without returning a result.")
+        elif queue.empty():
+            exit_code = process.exitcode
+            msg = (
+                f"Attempt {attempt_idx + 1} exited unexpectedly (code {exit_code})."
+                if exit_code not in (None, 0)
+                else f"Attempt {attempt_idx + 1} exited without returning a result."
+            )
+            run_result = _failure_run_result_payload(task_id, msg)
+        else:
+            item = queue.get()
+            if item.get("ok"):
+                run_result = dict(item["run_result"])
+                cumulative_input += run_result.pop("input_tokens", 0)
+                cumulative_output += run_result.pop("output_tokens", 0)
+                if attempt_idx == 0:
+                    preflight_result = run_result.pop("preflight", {})
+                else:
+                    run_result.pop("preflight", None)
+            else:
+                run_result = _failure_run_result_payload(
+                    task_id,
+                    f"Attempt {attempt_idx + 1} failed with uncaught error: {item.get('error', 'unknown')}",
+                )
 
-    result = queue.get()
-    if result.get("ok"):
-        return dict(result["run_result"])
-    return _failure_run_result_payload(task_id, f"Task failed with uncaught error: {result['error']}")
+        last_result = run_result
+
+        # Done — got an answer.
+        if run_result.get("answer") is not None:
+            break
+
+        # Only resume after step-exhaustion, not after timeout/crash.
+        failure_reason = run_result.get("failure_reason", "")
+        if "max_steps" not in failure_reason.lower():
+            break
+
+        # Prepare summary for the next attempt (if one remains).
+        if attempt_idx < len(attempt_timeouts) - 1:
+            summary = summarise_trace_for_resumption(run_result)
+            prior_summaries.append(summary)
+            # Persist the intermediate attempt trace and resumption summary so
+            # they can be inspected for debugging even if the final attempt
+            # succeeds (and overwrites trace.json).
+            task_output_dir = Path(config.run.output_dir) / config.run.run_id / task_id
+            task_output_dir.mkdir(parents=True, exist_ok=True)
+            attempt_num = attempt_idx + 1
+            _write_json(task_output_dir / f"trace_attempt_{attempt_num}.json", run_result)
+            (task_output_dir / f"resumption_summary_{attempt_num}.txt").write_text(
+                summary, encoding="utf-8"
+            )
+
+    last_result["preflight"] = preflight_result
+    last_result["input_tokens"] = cumulative_input
+    last_result["output_tokens"] = cumulative_output
+    return last_result
 
 
 def _write_task_outputs(task_id: str, run_output_dir: Path, run_result: dict[str, Any]) -> TaskRunArtifacts:
     task_output_dir = run_output_dir / task_id
     task_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save preflight analysis separately so it can be inspected independently.
+    preflight = run_result.pop("preflight", None)
+    if preflight:
+        _write_json(task_output_dir / "preflight.json", preflight)
+
     trace_path = task_output_dir / "trace.json"
     _write_json(trace_path, run_result)
 

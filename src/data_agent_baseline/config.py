@@ -38,6 +38,12 @@ class RunConfig:
     task_timeout_seconds: int = 600
     preflight_timeout_seconds: int = 30
     max_resumptions: int = 0
+    # Escalating per-attempt wall-clock budgets (seconds).
+    # If set, overrides task_timeout_seconds + max_resumptions entirely.
+    # Length of the list = total number of attempts (1 + resumptions).
+    # Example: [250, 500, 750] → attempt 1 gets 250 s, attempt 2 gets 500 s, attempt 3 gets 750 s.
+    # If empty, falls back to [task_timeout_seconds] * (1 + max_resumptions).
+    task_timeout_seconds_per_attempt: tuple[int, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +88,9 @@ def load_app_config(config_path: Path) -> AppConfig:
         normalized_run_id = str(raw_run_id).strip()
         run_id = normalized_run_id or None
 
+    raw_per_attempt = run_payload.get("task_timeout_seconds_per_attempt", [])
+    per_attempt: tuple[int, ...] = tuple(int(t) for t in raw_per_attempt) if raw_per_attempt else ()
+
     run_config = RunConfig(
         output_dir=_path_value(run_payload.get("output_dir"), run_defaults.output_dir),
         run_id=run_id,
@@ -89,5 +98,6 @@ def load_app_config(config_path: Path) -> AppConfig:
         task_timeout_seconds=int(run_payload.get("task_timeout_seconds", run_defaults.task_timeout_seconds)),
         preflight_timeout_seconds=int(run_payload.get("preflight_timeout_seconds", run_defaults.preflight_timeout_seconds)),
         max_resumptions=int(run_payload.get("max_resumptions", run_defaults.max_resumptions)),
+        task_timeout_seconds_per_attempt=per_attempt,
     )
     return AppConfig(dataset=dataset_config, agent=agent_config, run=run_config)
