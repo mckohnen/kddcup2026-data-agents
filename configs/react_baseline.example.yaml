@@ -1,15 +1,17 @@
 dataset:
-  root_path: data/public/input
+  root_path: data/public/input        # path to the task_*/ input directories
 
 agent:
   model: YOUR_MODEL_NAME
   api_base: YOUR_API_BASE_URL
   api_key: YOUR_API_KEY
-  max_steps: 16
+  max_steps: 16                        # max ReAct loop iterations per task
   temperature: 0.0
 
 run:
   output_dir: artifacts/runs
-  run_id: example_run_id
-  max_workers: 8
-  task_timeout_seconds: 600
+  run_id: example_run_id              # unique identifier; bump for each new run
+  max_workers: 4                       # parallel task workers
+  task_timeout_seconds: 900            # wall-clock limit per task (seconds)
+  preflight_timeout_seconds: 600        # budget for schema pre-analysis before the ReAct loop
+  max_resumptions: 2                   # how many times a timed-out task may be resumed

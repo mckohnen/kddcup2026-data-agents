@@ -18,8 +18,8 @@ The agent receives tabular-data tasks and must produce a `prediction.csv` answer
 src/data_agent_baseline/
 ├── agents/
 │   ├── react.py          # Generic ReAct loop (Thought → Action → Observation)
-│   ├── easy_task_agent.py # Specialised agent for "easy" difficulty tasks
-│   ├── model.py          # OpenAI-compatible model adapter
+│   ├── data_agent.py     # General-purpose agent wrapping ReActAgent (all difficulties)
+│   ├── model.py          # OpenAI-compatible model adapter (retry, timeout, token tracking)
 │   ├── prompt.py         # System / task / observation prompt builders
 │   └── runtime.py        # AgentRunResult, AgentRuntimeState, StepRecord
 ├── benchmark/
@@ -30,7 +30,7 @@ src/data_agent_baseline/
 │   ├── filesystem.py     # list_context, read_csv, read_json, read_doc
 │   ├── python_exec.py    # execute_python tool
 │   ├── sqlite.py         # inspect_sqlite_schema, execute_context_sql (original)
-│   ├── context_sqlite.py # get_context_schema, run_sql_on_context (easy-task variant)
+│   ├── context_sqlite.py # get_context_schema, run_sql_on_context (in-memory SQLite variant)
 │   └── input_detector.py # Classify context files by type before running agent
 ├── run/
 │   ├── runner.py         # run_single_task, run_benchmark, TaskRunArtifacts
@@ -39,7 +39,7 @@ src/data_agent_baseline/
 ├── config.py             # AppConfig, AgentConfig, DatasetConfig, RunConfig + YAML loader
 └── cli.py                # Typer CLI entry point (dabench run-benchmark)
 
-configs/                  # YAML config examples
+configs/                  # YAML config files (see react_baseline.example.yaml)
 submit.py                 # Docker submission entry point (reads env vars, not YAML)
 Dockerfile                # Competition image definition
 scripts/build_submission.sh  # Build + package image as <team_id>_v<N>.tar.gz
@@ -50,25 +50,29 @@ scripts/build_submission.sh  # Build + package image as <team_id>_v<N>.tar.gz
 ### Agent flow
 
 ```
-task.json + context/  →  InputDetector  →  EasyTaskAgent  →  prediction.csv
-                                                ↓
-                                          ReActAgent loop
-                                     (Thought / Action / Observation)
-                                                ↓
-                                    JSON action protocol:
-                                    { "thought": "...", "action": "...", "action_input": {...} }
-                                                ↓
-                                         ToolRegistry
-                          read_doc | show_context_schema | query_context_tables | answer
+task.json + context/  →  InputDetector  →  DataAgent  →  prediction.csv
+                                               ↓
+                                    preflight schema analysis
+                                               ↓
+                                         ReActAgent loop
+                                   (Thought → Action → Observation)
+                                               ↓
+                                   JSON action protocol:
+                                   { "thought": "...", "action": "...", "action_input": {...} }
+                                               ↓
+                                        ToolRegistry
+                         read_doc | show_context_schema | query_context_tables | answer
 ```
 
 ### Key design decisions
 
 - **JSON action protocol**: the model must emit a single JSON object per step. `parse_model_step` in `react.py` strips code fences and validates the schema.
-- **EasyTaskAgent** uses a fixed 4-tool set optimised for easy tasks (read knowledge.md → inspect schema → SQL → answer). The generic `ReActAgent` in `react.py` supports arbitrary tool registries.
-- **Only "easy" difficulty is currently handled.** `runner.py` skips non-easy tasks with a failure record.
+- **DataAgent** (`data_agent.py`) handles tasks of all difficulties. It runs a preflight schema-analysis step before the ReAct loop to build a task hint injected into the first user message.
 - **Input detection** runs before the agent on every task and writes `input_detection.json` alongside the trace. It classifies context files into csv / db / json / doc / other.
 - **Parallel execution** uses `ThreadPoolExecutor` (benchmark) and `multiprocessing` per task (for timeout enforcement). Pass `model=` or `tools=` to `run_benchmark` to force single-worker mode (for shared state).
+- **SQLite in-memory connections** in `context_sqlite.py` are created with `check_same_thread=False` so they can be shared between the preflight thread and the main ReAct thread safely.
+- **Model resilience** (`model.py`): API calls are wrapped in up to 6 retry attempts with exponential backoff + jitter for both `RateLimitError` and `APIConnectionError`. A hard `httpx.Timeout(read=120s)` prevents hung connections from blocking a task indefinitely.
+- **Answer critic**: after the model proposes an `answer` action, a second model call checks the structural shape (extra columns, wrong scalar shape) before the answer is accepted. Factual correctness is not checked.
 
 ## Local development
 
@@ -78,14 +82,36 @@ task.json + context/  →  InputDetector  →  EasyTaskAgent  →  prediction.cs
 uv sync
 ```
 
-### Copy and fill in the config
+### Config files
+
+Copy the example and fill in your credentials:
 
 ```bash
 cp configs/react_baseline.example.yaml configs/react_baseline.local.yaml
-# edit: set model, api_base, api_key, dataset root path
+# edit: set api_base, api_key; adjust run_id before each new run
 ```
 
-### Run on public dataset
+Key config parameters (see `react_baseline.example.yaml` for annotated defaults):
+
+| Parameter | Description |
+|---|---|
+| `dataset.root_path` | Path to the `task_*/` input directories |
+| `agent.max_steps` | Max ReAct iterations per task (default 16) |
+| `run.run_id` | Unique identifier — bump before each run to avoid overwriting |
+| `run.max_workers` | Parallel task workers |
+| `run.task_timeout_seconds` | Wall-clock limit per task (default 900 s) |
+| `run.preflight_timeout_seconds` | Budget for schema pre-analysis (default 60 s) |
+| `run.max_resumptions` | How many times a timed-out task may be resumed (default 2) |
+
+### Available configs
+
+| Config file | Dataset | Purpose |
+|---|---|---|
+| `react_baseline.local.yaml` | `data/public/input` (all 50 tasks) | Full local test / submission prep |
+| `react_baseline.imperfect.yaml` | `data/imperfect/input` (16 tasks) | Fast iteration on previously failing tasks |
+| `react_baseline.test3.yaml` | `data/test3/input` | Test3 dataset runs |
+
+### Run benchmark
 
 ```bash
 uv run dabench run-benchmark --config configs/react_baseline.local.yaml
@@ -94,10 +120,13 @@ uv run dabench run-benchmark --config configs/react_baseline.local.yaml
 
 ### Run evaluation (needs gold files)
 
-Evaluation runs automatically at the end of `run-benchmark` if `data/public/evaluation/` exists.
-Gold CSVs must be at `data/public/evaluation/task_<id>/gold.csv`.
+Evaluation runs automatically at the end of `run-benchmark` if a matching `evaluation/` directory exists next to `input/` (e.g. `data/public/evaluation/task_<id>/gold.csv`).
 
-### Run a single task (use Python API, CLI command is commented out)
+The local evaluator matches competition scoring:
+- **Numeric precision**: cell values are normalized to 2 decimal places before comparison.
+- **Name-column equivalence**: if gold has explicit `first_name` + `last_name` columns, a prediction with a single combined full-name column is treated as correct.
+
+### Run a single task (Python API)
 
 ```python
 from pathlib import Path
@@ -106,7 +135,7 @@ from data_agent_baseline.run.runner import create_run_output_dir, run_single_tas
 
 config = load_app_config(Path("configs/react_baseline.local.yaml"))
 _, run_output_dir = create_run_output_dir(config.run.output_dir, run_id="debug")
-artifact = run_single_task(task_id="task_1", config=config, run_output_dir=run_output_dir)
+artifact = run_single_task(task_id="task_163", config=config, run_output_dir=run_output_dir)
 print(artifact)
 ```
 
@@ -163,7 +192,13 @@ docker run --rm \
 - **No hardcoded credentials.** `submit.py` reads everything from env vars.
 - **`/input/` is read-only.** Never write to it.
 - **No GPU.** All compute is CPU-only.
-- **12-hour total wall-clock limit** across all tasks. Per-task timeout in config is 600 s.
+- **12-hour total wall-clock limit** across all tasks. Per-task timeout in config is 900 s.
 - **Scoring:** column-level matching, `Score = Recall − λ × (ExtraColumns / PredictedColumns)`. Extra columns hurt — only output what the question asks for.
 - The model name injected is always `qwen3.5-35b-a3b`; do not hard-code any other model name in submission code.
-- Never modify any of the original input files, including the knowledge.md files.
+
+## Inviolable rules for all code and prompt changes
+
+1. **Never modify task data.** The files under `data/` (task.json, context files, knowledge.md, gold CSVs, etc.) must never be edited to help the agent. They are read-only competition inputs.
+2. **Prompt and tool changes must be generalizable.** No dataset-specific instructions, no hardcoded column names, topics, or domain knowledge. Changes must work correctly across all tasks.
+3. **No rounding in agent output.** The competition normalizes numerics to 2 dp at scoring time. Never use `ROUND()`, `FORMAT()`, or Python's `round()` in the agent's SQL or Python — return raw computed values.
+4. **Name column format is irrelevant.** The competition accepts both split (`first_name` + `last_name`) and combined (`full_name`) forms. Do not add instructions that force one format over the other.

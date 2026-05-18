@@ -11,7 +11,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-from data_agent_baseline.agents.data_agent import DataAgent
+from data_agent_baseline.agents.data_agent import DataAgent, summarise_trace_for_resumption
 from data_agent_baseline.agents.model import OpenAIModelAdapter
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.config import AppConfig
@@ -112,8 +112,32 @@ def _run_single_task_core(
     agent = DataAgent(
         model=model_instance,
         max_steps=config.agent.max_steps,
+        preflight_timeout_seconds=config.run.preflight_timeout_seconds,
     )
+
+    # --- First attempt ---
     run_result = agent.run(task).to_dict()
+
+    # --- Resumption loop ---
+    # If the agent ran out of steps without submitting an answer, retry up to
+    # max_resumptions times.  Each retry receives a compact summary of all prior
+    # attempts so it can skip already-explored paths.
+    max_resumptions = config.run.max_resumptions
+    prior_summaries: list[str] = []
+
+    for _resumption_round in range(max_resumptions):
+        # Only resume when the attempt exhausted max_steps without answering.
+        if run_result.get("answer") is not None:
+            break  # Got an answer — no resumption needed.
+        failure_reason = run_result.get("failure_reason", "")
+        if "max_steps" not in failure_reason.lower():
+            break  # Failure was not step-exhaustion (e.g. crash) — don't retry.
+
+        # Summarise the trace and re-run with accumulated prior context.
+        prior_summaries.append(summarise_trace_for_resumption(run_result))
+        run_result = agent.run(task, prior_attempts=prior_summaries).to_dict()
+
+    # Token counts on the model adapter are cumulative across all attempts.
     run_result["input_tokens"] = getattr(model_instance, "total_input_tokens", 0)
     run_result["output_tokens"] = getattr(model_instance, "total_output_tokens", 0)
     return run_result
@@ -137,9 +161,17 @@ def _run_single_task_in_subprocess(task_id: str, config: AppConfig, queue: multi
 
 
 def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[str, Any]:
-    timeout_seconds = config.run.task_timeout_seconds
-    if timeout_seconds <= 0:
+    agent_timeout = config.run.task_timeout_seconds
+    if agent_timeout <= 0:
         return _run_single_task_core(task_id=task_id, config=config)
+
+    # The outer wall-clock budget covers pre-flight AND agent work.
+    # Pre-flight runs in its own thread (capped by preflight_timeout_seconds) inside
+    # the subprocess, so we must give the subprocess enough time for both phases.
+    # On top of that, add headroom per resumption round so retries don't get cut off.
+    preflight_budget = config.run.preflight_timeout_seconds
+    resumption_rounds = max(0, config.run.max_resumptions)
+    timeout_seconds = preflight_budget + agent_timeout * (1 + resumption_rounds)
 
     ctx = multiprocessing.get_context("spawn")
     queue: multiprocessing.Queue[Any] = ctx.Queue()

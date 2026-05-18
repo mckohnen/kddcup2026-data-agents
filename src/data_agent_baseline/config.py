@@ -36,6 +36,8 @@ class RunConfig:
     run_id: str | None = None
     max_workers: int = 4
     task_timeout_seconds: int = 600
+    preflight_timeout_seconds: int = 30
+    max_resumptions: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,5 +87,7 @@ def load_app_config(config_path: Path) -> AppConfig:
         run_id=run_id,
         max_workers=int(run_payload.get("max_workers", run_defaults.max_workers)),
         task_timeout_seconds=int(run_payload.get("task_timeout_seconds", run_defaults.task_timeout_seconds)),
+        preflight_timeout_seconds=int(run_payload.get("preflight_timeout_seconds", run_defaults.preflight_timeout_seconds)),
+        max_resumptions=int(run_payload.get("max_resumptions", run_defaults.max_resumptions)),
     )
     return AppConfig(dataset=dataset_config, agent=agent_config, run=run_config)
