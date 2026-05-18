@@ -148,6 +148,8 @@ Step 5 — Validate before submitting:
      column (the natural key or ID column) that identifies each X.
      Do NOT add supplementary columns (amounts, dates, counts, descriptions, status) unless
      the question explicitly asks for those attributes too.
+     EXCEPTION: "what is the [content]" questions (e.g. "what is the comment/message/text/
+     description/title") ask for the content itself, not an ID. Return the content column.
   3. Column names come directly from the source data. Never invent aliases or rename columns.
   4. Result shape matches the question's intent:
      - "how many" → 1 row, 1 column (a single count).
@@ -156,6 +158,8 @@ Step 5 — Validate before submitting:
        never add a count/frequency column alongside them unless the question explicitly
        uses words like "count", "how many", "how often", "number of", or "frequency".
      - "list [entities]" → one row per unique entity, not one row per relationship record.
+     - "which/what X has the highest/lowest/maximum/minimum Y" → use WHERE Y = (SELECT
+       MAX/MIN(Y) ...) to capture ALL tied rows, not ORDER BY ... LIMIT 1.
 
 Step 6 — Submit:
   Call answer with the final result table.
@@ -241,6 +245,9 @@ def _query_context_tables(task: PublicTask, action_input: dict) -> ToolExecution
     return ToolExecutionResult(ok=True, content=result)
 
 
+_EXECUTE_PYTHON_MAX_OUTPUT_CHARS = 3000
+
+
 def _execute_python(task: PublicTask, action_input: dict) -> ToolExecutionResult:
     code = str(action_input["code"])
     content = execute_python_code(
@@ -248,6 +255,18 @@ def _execute_python(task: PublicTask, action_input: dict) -> ToolExecutionResult
         code=code,
         timeout_seconds=EXECUTE_PYTHON_TIMEOUT_SECONDS,
     )
+    # Truncate large outputs before they enter the conversation history.
+    # Without this, a single execute_python call that returns thousands of
+    # characters of raw document text (e.g. medical lab reports) fills the
+    # context window and triggers content-filter rejections on every
+    # subsequent model call, crashing the remaining agent steps.
+    raw_output = content.get("output", "") or ""
+    if len(raw_output) > _EXECUTE_PYTHON_MAX_OUTPUT_CHARS:
+        content = dict(content)  # don't mutate the original
+        content["output"] = (
+            raw_output[:_EXECUTE_PYTHON_MAX_OUTPUT_CHARS]
+            + f"\n[output truncated — {len(raw_output)} chars total, showing first {_EXECUTE_PYTHON_MAX_OUTPUT_CHARS}]"
+        )
     return ToolExecutionResult(ok=bool(content.get("success")), content=content)
 
 
@@ -382,7 +401,8 @@ def summarise_trace_for_resumption(trace_dict: dict) -> str:
     skip already-explored paths.  It highlights:
     - Tables confirmed to exist in the schema
     - SQL queries that returned non-empty results (with row counts)
-    - The last few thoughts (what the agent was trying to do)
+    - Tools that caused repeated errors (e.g. API content-filter rejections)
+    - The last few non-empty thoughts (what the agent was trying to do)
     - The blocking issue (why the attempt didn't produce an answer)
     """
     steps = trace_dict.get("steps", [])
@@ -392,8 +412,11 @@ def summarise_trace_for_resumption(trace_dict: dict) -> str:
     confirmed_tables: list[str] = []
     # Collect productive SQL (queries that returned rows)
     productive_sql: list[str] = []
-    # Collect the last N thoughts
+    # Collect the last N non-empty thoughts
     last_thoughts: list[str] = []
+    # Detect consecutive API errors (e.g. content-filter rejections)
+    failed_actions: list[str] = []  # actions that produced errors
+    consecutive_errors = 0
 
     for step in steps:
         action = step.get("action", "")
@@ -412,6 +435,15 @@ def summarise_trace_for_resumption(trace_dict: dict) -> str:
                 row_count = len(rows)
                 productive_sql.append(f"  [{row_count} rows] {sql[:120].strip()}")
 
+        # Track repeated model-level errors (content filter, parse failures, etc.)
+        if action == "__error__":
+            error_msg = obs.get("error", "")
+            consecutive_errors += 1
+            if consecutive_errors >= 3:
+                failed_actions.append(error_msg[:120])
+        else:
+            consecutive_errors = 0
+
         if thought:
             last_thoughts.append(thought)
 
@@ -425,11 +457,22 @@ def summarise_trace_for_resumption(trace_dict: dict) -> str:
         for s in productive_sql[-5:]:  # last 5 productive queries
             lines.append(s)
 
-    # Last 3 thoughts show what the agent was trying to do
+    # Last 3 non-empty thoughts show what the agent was trying to do
     if last_thoughts:
         lines.append("Last agent thoughts (context on what was being attempted):")
         for t in last_thoughts[-3:]:
             lines.append(f"  - {t[:150]}")
+
+    # Warn if repeated API errors occurred — the next attempt must avoid that approach
+    if failed_actions:
+        representative = failed_actions[-1]
+        lines.append(
+            f"WARNING: This attempt hit {len(failed_actions)} consecutive model errors "
+            f"(e.g. '{representative}'). "
+            "The approach that triggered them must NOT be repeated. "
+            "If execute_python produced large text output that caused content-filter errors, "
+            "use read_doc with a focused query instead — it returns only relevant sections."
+        )
 
     lines.append(f"Blocking issue: {failure_reason}")
     lines.append(
