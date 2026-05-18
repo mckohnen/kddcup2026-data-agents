@@ -276,9 +276,11 @@ def main() -> None:
 
     if evaluation:
         mean = evaluation.get("mean_score", 0)
+        mean_all = evaluation.get("mean_score_all", mean)
         evaled = evaluation.get("evaluated", 0)
         skipped = evaluation.get("skipped", 0)
-        print(f"\nMean score: {mean:.4f}  ({evaled} evaluated, {skipped} skipped)")
+        print(f"\nMean score (excl. skipped): {mean:.4f}  ({evaled} evaluated, {skipped} skipped)")
+        print(f"Mean score (incl. skipped): {mean_all:.4f}  (skipped tasks count as 0)")
 
     # --- Per-task table ---
     print(f"\n{'Task':<14} {'Failure Mode':<30} {'Steps':>5}  {'Score':>6}  {'Recall':>6}  {'Extra':>5}  {'Elapsed':>8}")

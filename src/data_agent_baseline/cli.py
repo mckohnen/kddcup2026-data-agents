@@ -272,7 +272,8 @@ def run_benchmark_command(
         eval_result = evaluate_run(run_output_dir, evaluation_dir)
         report_path = write_evaluation_report(eval_result, run_output_dir)
         console.print(f"Evaluated: {eval_result.evaluated} tasks | Skipped: {eval_result.skipped} tasks")
-        console.print(f"[bold green]Mean score: {eval_result.mean_score:.4f}[/bold green]")
+        console.print(f"[bold green]Mean score (excl. skipped): {eval_result.mean_score:.4f}[/bold green]")
+        console.print(f"[bold green]Mean score (incl. skipped): {eval_result.mean_score_all:.4f}[/bold green]")
         console.print(f"Report: {report_path}")
     else:
         console.print(f"\n[yellow]Evaluation dir not found ({evaluation_dir}), skipping evaluation.[/yellow]")

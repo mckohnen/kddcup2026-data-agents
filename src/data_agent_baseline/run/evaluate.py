@@ -279,13 +279,15 @@ def score_task(prediction_path: Path, gold_path: Path) -> dict[str, Any]:
 @dataclass
 class EvaluationResult:
     task_scores: dict[str, dict[str, Any]]  # task_id -> score dict
-    mean_score: float
+    mean_score: float          # mean over evaluated tasks only (skipped excluded)
+    mean_score_all: float      # mean over all gold tasks (skipped count as 0)
     evaluated: int
     skipped: int  # tasks with no gold or no prediction
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "mean_score": round(self.mean_score, 4),
+            "mean_score_all": round(self.mean_score_all, 4),
             "evaluated": self.evaluated,
             "skipped": self.skipped,
             "tasks": self.task_scores,
@@ -318,11 +320,14 @@ def evaluate_run(run_output_dir: Path, evaluation_dir: Path) -> EvaluationResult
         else:
             scores.append(result["score"])
 
+    total_gold = len(gold_task_ids)
     mean_score = sum(scores) / len(scores) if scores else 0.0
+    mean_score_all = sum(scores) / total_gold if total_gold else 0.0
 
     return EvaluationResult(
         task_scores=task_scores,
         mean_score=mean_score,
+        mean_score_all=mean_score_all,
         evaluated=len(scores),
         skipped=skipped,
     )
