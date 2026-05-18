@@ -140,8 +140,11 @@ def _retry_delay(exc: APIError, attempt: int) -> float:
         pass
 
     if retry_after is not None:
-        # Add a small jitter on top of the server hint.
-        return retry_after + random.uniform(0, _JITTER_RANGE)
+        # Honour the server hint but cap it at _MAX_RETRY_DELAY so a large
+        # Retry-After value (e.g. 600 s) cannot burn the entire task budget
+        # across six retries.  The cap means we may retry before the server is
+        # fully ready, but _MAX_RETRIES limits the total number of attempts.
+        return min(retry_after, _MAX_RETRY_DELAY) + random.uniform(0, _JITTER_RANGE)
 
     # Exponential backoff: 2s, 4s, 8s, 16s, 32s … capped at 60s, plus jitter.
     backoff = min(_MAX_RETRY_DELAY, _BASE_RETRY_DELAY * (2 ** attempt))

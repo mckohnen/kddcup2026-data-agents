@@ -43,12 +43,23 @@ Step 2 — Read documentation:
     question's intent — never guess; always look it up.
   - Value encodings: filters like label='+', status='Y', type='A' must match exactly.
     Read the documentation to find the exact string value used in the data.
+  - Categorical value matching: when the question uses a phrase that corresponds to
+    a column value, filter for that exact string (e.g. 'confirmed orders' →
+    `orders = 'confirmed'`, 'active members' → `members = 'active'`, 'valid type' → `type = 'valid'`). Do not treat
+    the phrase as a description of having any non-null value — match the literal
+    string you observed in the schema or documentation.
   - Example queries: replicate their logic, not just their structure.
   For large doc/ files, call read_doc with the task question as context — relevant sections
-  will be surfaced automatically. For exhaustive extraction from large prose documents
-  (e.g. listing every entity with a certain label), use execute_python instead.
+  will be surfaced automatically via relevance ranking.
+  Do NOT use execute_python to search for keywords or values inside prose documents.
+  Always try read_doc first; only escalate to execute_python for exhaustive entity
+  extraction (e.g. listing ALL entities of a type from a document).
 
-Step 3 — Inspect schema:
+Step 3 — Inspect schema and consider ALL data sources:
+  Treat every file in the context as a potential data source. Never conclude "no data
+  exists" after checking only one table. Cross-check all CSV, JSON, and database files —
+  each may contain different records or reference data that is needed to answer the
+  question. If one data source returns no results, look in the others before giving up.
   Call show_context_schema to see all tables, columns, row counts, type hints, and inferred
   relationships. ALL data sources are unified in one SQLite connection:
   - CSV and JSON files → accessible as plain table names (e.g. SELECT * FROM atom)
@@ -70,6 +81,13 @@ Step 4 — Query and analyse:
   - When ordering by a numeric ID suffix (e.g. atom_id like 'TR001_12'), always sort
     numerically: ORDER BY CAST(SUBSTR(col, INSTR(col, '_') + 1) AS INTEGER)
   - Never add LIMIT to the final answer query — return all matching rows.
+  - Trust your SQL: once your WHERE clause correctly encodes the question's condition,
+    trust ALL rows it returns. Never discard or manually filter rows from the result
+    based on subjective reasoning (e.g. "closer to the target value"). The query
+    result IS the answer — submit every row it produces.
+  - When a question asks for the 'type of X', GROUP BY the short categorical `type`
+    column on the entity table (e.g. `event.type`, `category`), not by a description
+    or name field. Type columns hold values like 'Meeting', 'Election', 'Purchase'.
   - Do NOT round or truncate numeric results. Never use ROUND(), FORMAT(), or Python's
     round(). Return the exact value computed by SQL or Python — the evaluation system
     handles precision normalization.
@@ -98,14 +116,26 @@ Step 4 — Query and analyse:
     (you get "no such table" error), use execute_python to load the relevant .md or
     .csv file into a pandas DataFrame and run the analysis there. Do not give up after
     a "no such table" error — the data may live in a doc file.
+  - Standard domain thresholds: first search ALL context files (knowledge.md, every doc/,
+    every CSV header, every table) for explicitly defined thresholds. Only if none are
+    found anywhere in the context, fall back to your training knowledge of well-known
+    reference values (e.g. clinical normal ranges, physical constants, industry standards).
+    When using training knowledge, state in your thought exactly which values you assumed
+    and confirm no definition was found in the context.
+    IMPORTANT: if you have already made 2 or more doc/knowledge searches for a threshold
+    and found nothing, treat the search as exhausted — do NOT repeat the same search.
+    Immediately apply standard domain knowledge values and proceed to your SQL query.
 
-  For prose document extraction (e.g. extracting entity labels from a Markdown file),
-  use execute_python:
+  For exhaustive entity extraction from prose documents (e.g. listing every patient whose
+  label is X, collecting all values of a field across a large Markdown file), use
+  execute_python ONLY after read_doc has failed to surface what you need:
     - Open the file by path under the context directory.
     - Process it paragraph by paragraph (not sentence by sentence) to handle cases where
       an entity ID and its classification appear in different sentences of the same paragraph.
     - Print structured output (e.g. JSON list) to stdout; keep the script focused on a
       single task. Do NOT mix SQLite connections into the same Python step as file reading.
+    - Keep printed output concise — print only the final structured result, not every
+      intermediate line you inspect. Large raw text dumps will be truncated.
 
 Step 5 — Validate before submitting:
   Before calling answer, verify:
@@ -114,9 +144,10 @@ Step 5 — Validate before submitting:
   2. Column count matches the question: "how many" / "what is X" → 1 column;
      "list X and Y" → 2 columns. Do NOT add extra columns (counts, IDs, labels) unless
      the question explicitly asks for them.
-     "List all [X]" → return ONLY the column(s) that identify or describe X as asked.
-     Do NOT add supplementary columns (amounts, dates, counts, descriptions) unless the
-     question explicitly requests them.
+     "List all [X]" or "List all [X] that [condition]" → return ONLY the primary identifier
+     column (the natural key or ID column) that identifies each X.
+     Do NOT add supplementary columns (amounts, dates, counts, descriptions, status) unless
+     the question explicitly asks for those attributes too.
   3. Column names come directly from the source data. Never invent aliases or rename columns.
   4. Result shape matches the question's intent:
      - "how many" → 1 row, 1 column (a single count).
@@ -184,7 +215,7 @@ def _read_knowledge_section(task: PublicTask, action_input: dict) -> ToolExecuti
 
 def _show_context_schema(task: PublicTask, action_input: dict) -> ToolExecutionResult:
     del action_input
-    profile = build_schema_profile(task.context_dir)
+    profile = build_schema_profile(task.context_dir, question=task.question)
     return ToolExecutionResult(ok=True, content=profile)
 
 
@@ -474,7 +505,7 @@ class DataAgent:
 
         def _run_preflight() -> None:
             try:
-                schema = build_schema_profile(task.context_dir)
+                schema = build_schema_profile(task.context_dir, question=task.question)
                 analysis = build_task_analysis(task.question, schema, task.context_dir)
                 hint = format_task_analysis_hint(analysis)
                 task_analysis.update(analysis)
@@ -487,6 +518,11 @@ class DataAgent:
         _t.start()
         _t.join(timeout=self.preflight_timeout_seconds)
         task_hint = _preflight_result.get("hint")
+        # Store for the caller (runner.py saves this as preflight.json).
+        self._last_preflight: dict = {
+            "hint": task_hint or "",
+            "task_analysis": dict(task_analysis),
+        }
 
         # Prepend prior attempt summaries to the task hint so the agent can
         # skip already-explored paths and focus on what's left to try.

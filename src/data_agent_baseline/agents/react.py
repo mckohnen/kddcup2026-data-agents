@@ -67,18 +67,37 @@ def _load_single_json_object(text: str) -> dict[str, object]:
 def _try_repair_json(raw_response: str) -> str | None:
     """Attempt lightweight repair of common LLM JSON formatting errors.
 
-    Handles the most frequent case: trailing commas before } or ].
+    Handles two frequent cases:
+    1. Trailing commas before } or ]  — e.g. {"a":1,}
+    2. Trailing closing braces after a valid object  — e.g. {"a":1}}
+       Some models (qwen3.5) emit an extra } after the JSON object when the
+       action_input itself contains nested braces.  raw_decode() parses the
+       first complete object and leaves the remainder as "}"; we strip it.
     Returns a repaired string on success, or None if the response is
     unrecoverable.
     """
     text = _strip_json_fence(raw_response)
 
-    # Remove trailing commas before closing braces / brackets
+    # Repair 1: trailing commas before closing braces / brackets
     cleaned = re.sub(r",(\s*[}\]])", r"\1", text)
 
     try:
         _load_single_json_object(cleaned)
         return cleaned
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Repair 2: strip trailing bare } or ] characters that appear after a
+    # complete JSON object.  raw_decode gives us the end index of the first
+    # valid object; anything after that which is only whitespace and closing
+    # braces/brackets is dropped.
+    try:
+        _, end = json.JSONDecoder().raw_decode(cleaned)
+        remainder = cleaned[end:].strip()
+        if remainder and re.fullmatch(r"[}\]]+", remainder):
+            trimmed = cleaned[:end]
+            _load_single_json_object(trimmed)
+            return trimmed
     except (json.JSONDecodeError, ValueError):
         pass
 
@@ -117,11 +136,18 @@ _CRITIC_SYSTEM_PROMPT = (
     "   - 'What is the name?' answered with [name, id] → flag the id column\n"
     "   - 'List the values' answered with [value, count] → flag count (unless question asked for it)\n"
     "   - 'What is the average?' answered with [average, total, count] → flag total and count\n"
-    "2. Wrong scalar shape: a question asking 'how many' / 'what is the total/count/average' "
-    "expects exactly 1 row and 1 column. Flag if the answer has multiple rows for a scalar question.\n\n"
+    "2. Wrong scalar shape: ONLY flag this when the question uses EXPLICIT aggregation language "
+    "such as 'how many', 'what is the total', 'what is the count', 'what is the average', "
+    "'what is the sum', 'what percentage'. These expect exactly 1 row and 1 column.\n"
+    "   NEVER flag multi-row answers for questions using 'what is the X of Y', 'list', 'which', "
+    "   'find', 'identify', or any phrasing that does NOT explicitly ask for a single aggregate "
+    "   — multiple matching entities are a perfectly valid answer.\n\n"
     "CRITICAL — do NOT flag any of the following:\n"
     "- Column naming style: aliases, SQL expressions like AVG(...), source column names — all fine\n"
     "- Zero rows: 0 rows is a perfectly valid answer when no data matches the filter\n"
+    "- Multiple rows for non-aggregate questions: e.g. 'What is the product code?' or "
+    "  'What is the category?' can legitimately return multiple rows when multiple entities match "
+    "  — do NOT assume singular phrasing means exactly one result\n"
     "- Factual correctness: you have NO access to ground truth. Never use your training knowledge "
     "  to override what the SQL returned (e.g. do not say 'X should be Y based on your knowledge')\n"
     "- Column names not matching schema candidates: schema candidates are heuristic and incomplete\n"
