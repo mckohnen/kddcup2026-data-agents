@@ -108,17 +108,27 @@ def parse_model_step(raw_response: str) -> ModelStep:
 
 
 _CRITIC_SYSTEM_PROMPT = (
-    "You are a concise data quality critic. "
-    "Review the proposed answer to the question and check for these issues:\n"
-    "1. Extra columns: are there columns not explicitly requested (e.g. a 'count' alongside "
-    "   values when only values were asked for, or an 'id' column when only names were asked)?\n"
-    "2. Wrong column names: do the column names look renamed or aliased rather than taken "
-    "   directly from the source data?\n"
-    "3. Shape mismatch: 'how many' → 1 row 1 col; 'list/tally values' → distinct values only.\n"
-    "4. Obvious wrong answer: e.g. zero rows when some result is clearly expected.\n"
+    "You are a structural data quality critic. "
+    "Your ONLY job is to check the SHAPE of the proposed answer — not its content, values, or "
+    "column naming style.\n\n"
+    "Check ONLY these two structural issues:\n"
+    "1. Too many columns: did the agent include columns that were NOT explicitly requested?\n"
+    "   Examples to flag:\n"
+    "   - 'What is the name?' answered with [name, id] → flag the id column\n"
+    "   - 'List the values' answered with [value, count] → flag count (unless question asked for it)\n"
+    "   - 'What is the average?' answered with [average, total, count] → flag total and count\n"
+    "2. Wrong scalar shape: a question asking 'how many' / 'what is the total/count/average' "
+    "expects exactly 1 row and 1 column. Flag if the answer has multiple rows for a scalar question.\n\n"
+    "CRITICAL — do NOT flag any of the following:\n"
+    "- Column naming style: aliases, SQL expressions like AVG(...), source column names — all fine\n"
+    "- Zero rows: 0 rows is a perfectly valid answer when no data matches the filter\n"
+    "- Factual correctness: you have NO access to ground truth. Never use your training knowledge "
+    "  to override what the SQL returned (e.g. do not say 'X should be Y based on your knowledge')\n"
+    "- Column names not matching schema candidates: schema candidates are heuristic and incomplete\n"
+    "- Aggregated values: computing SUM, AVG, COUNT is valid even if the column is named differently\n\n"
     "Reply with exactly one of:\n"
     "  OK\n"
-    "  CONCERN: <one sentence describing the specific problem>\n"
+    "  CONCERN: <one sentence describing the specific structural problem>\n"
     "No other text."
 )
 
@@ -130,42 +140,24 @@ def _run_critic_check(
     rows: list,
     task_analysis: dict | None = None,
 ) -> str | None:
-    """Call the model as a critic to review a proposed answer.
+    """Call the model as a structural critic to review a proposed answer.
 
-    If ``task_analysis`` is provided (output of ``build_task_analysis``), the
-    critic receives the list of strong candidate columns so it can flag cases
-    where the proposed column doesn't match what the question references.
+    Checks only shape issues (extra columns, wrong scalar shape).
+    Does NOT validate column names, factual correctness, or zero-row results.
+    The ``task_analysis`` parameter is kept for API compatibility but is no longer
+    injected into the critic prompt — schema candidates are heuristic and caused
+    false positives blocking correct answers.
 
-    Returns a concern string if the critic flags an issue, or None if the
-    answer looks fine.  Errors are silently swallowed so they never block a
-    valid answer.
+    Returns a concern string if a structural issue is found, or None if OK.
+    Errors are silently swallowed so they never block a valid answer.
     """
     preview_rows = rows[:5]
 
-    # Build optional column-grounding context for the critic
-    grounding = ""
-    if task_analysis:
-        strong_cols = [
-            m for m in task_analysis.get("matched_terms", [])
-            if m.get("matched_column") and m["confidence"] >= 0.8
-        ]
-        if strong_cols:
-            col_hints = ", ".join(
-                f"{m['matched_table']}.{m['matched_column']} (matched \"{m['text']}\")"
-                for m in strong_cols
-            )
-            grounding = (
-                f"\nQuestion-to-schema analysis found these strong column candidates: {col_hints}. "
-                "If the proposed column doesn't appear in this list, check whether a better "
-                "column exists."
-            )
-
     critic_user = (
         f"Question: {question}\n"
-        f"Proposed answer columns: {columns}\n"
-        f"Proposed answer rows (first {len(preview_rows)} of {len(rows)}): {preview_rows}"
-        f"{grounding}\n\n"
-        "Is there a problem with this answer?"
+        f"Proposed answer — columns: {columns}, "
+        f"rows (first {len(preview_rows)} of {len(rows)}): {preview_rows}\n\n"
+        "Is there a structural problem with this answer?"
     )
     try:
         response = model.complete(
@@ -242,8 +234,9 @@ class ReActAgent:
     def run(self, task: PublicTask) -> AgentRunResult:
         state = AgentRuntimeState()
         for step_index in range(1, self.config.max_steps + 1):
-            raw_response = self.model.complete(self._build_messages(task, state))
+            raw_response = ""  # safe default — ensures the except branch has a valid value
             try:
+                raw_response = self.model.complete(self._build_messages(task, state))
                 model_step = parse_model_step(raw_response)
 
                 # --- Critic gate: review proposed answers before executing them ---
