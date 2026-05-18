@@ -70,6 +70,9 @@ def _execute_context_sql(task: PublicTask, action_input: dict[str, Any]) -> Tool
     return ToolExecutionResult(ok=True, content=execute_read_only_sql(path, sql, limit=limit))
 
 
+_EXECUTE_PYTHON_MAX_OUTPUT_CHARS = 3000
+
+
 def _execute_python(task: PublicTask, action_input: dict[str, Any]) -> ToolExecutionResult:
     code = str(action_input["code"])
     content = execute_python_code(
@@ -77,6 +80,18 @@ def _execute_python(task: PublicTask, action_input: dict[str, Any]) -> ToolExecu
         code=code,
         timeout_seconds=EXECUTE_PYTHON_TIMEOUT_SECONDS,
     )
+    # Truncate large outputs before they enter the conversation history.
+    # Without this, a single execute_python call that returns thousands of
+    # characters of raw document text (e.g. medical lab reports) fills the
+    # context window and can trigger content-filter rejections on every
+    # subsequent model call, crashing the remaining agent steps.
+    raw_output = content.get("output", "") or ""
+    if len(raw_output) > _EXECUTE_PYTHON_MAX_OUTPUT_CHARS:
+        content = dict(content)  # don't mutate the original
+        content["output"] = (
+            raw_output[:_EXECUTE_PYTHON_MAX_OUTPUT_CHARS]
+            + f"\n[output truncated — {len(raw_output)} chars total, showing first {_EXECUTE_PYTHON_MAX_OUTPUT_CHARS}]"
+        )
     return ToolExecutionResult(ok=bool(content.get("success")), content=content)
 
 

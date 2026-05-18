@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sqlite3
 from itertools import islice
 from pathlib import Path
@@ -16,6 +17,66 @@ _conn_cache: dict[str, sqlite3.Connection] = {}
 _db_aliases: dict[str, list[str]] = {}
 
 _DB_EXTENSIONS = ("*.db", "*.sqlite", "*.sqlite3")
+
+# CSV files larger than this threshold get column-pruned before loading.
+# Only columns relevant to the question (plus all ID/key columns) are loaded,
+# reducing memory use and load time dramatically for wide tables.
+_LARGE_CSV_THRESHOLD_BYTES = 20 * 1024 * 1024  # 20 MB
+
+
+def _question_words(question: str) -> set[str]:
+    """Extract lowercase, punctuation-stripped words from a question string."""
+    return set(re.sub(r"[^a-z0-9 ]", " ", question.lower()).split())
+
+
+def _select_columns_for_large_csv(
+    all_columns: list[str], question: str
+) -> list[str]:
+    """Choose which columns to load from a large CSV.
+
+    Strategy (column is kept if ANY rule matches):
+    1. Always-keep: columns whose name ends with ``_id``, starts with ``id``,
+       or contains common structural keywords (date, time, season, stage, year,
+       month, name, type, code, key, flag) — these are needed for joins, filters,
+       and group-bys regardless of the question.
+    2. Question-match: any column whose name (lowercased, underscores → spaces)
+       shares at least one word with the question.
+
+    Falls back to the full column list when the heuristic selects fewer than 5
+    columns (guards against empty/degenerate questions).
+    """
+    q_words = _question_words(question)
+
+    _STRUCTURAL_KEYWORDS = {
+        "id", "date", "time", "year", "month", "season", "stage", "name",
+        "type", "code", "key", "flag", "status", "rank", "score", "goal",
+        "result", "label", "category", "class", "group", "level", "value",
+    }
+
+    selected: list[str] = []
+    for col in all_columns:
+        col_lower = col.lower()
+        col_words = set(re.sub(r"[^a-z0-9 ]", " ", col_lower).split())
+
+        # Rule 1: structural / key columns
+        if (
+            col_lower == "id"
+            or col_lower.startswith("id_")
+            or col_lower.endswith("_id")
+            or bool(col_words & _STRUCTURAL_KEYWORDS)
+        ):
+            selected.append(col)
+            continue
+
+        # Rule 2: question-word match
+        if col_words & q_words:
+            selected.append(col)
+
+    # Fallback: return all columns if heuristic is too aggressive
+    if len(selected) < 5:
+        return all_columns
+
+    return selected
 
 
 def _sanitize(name: str) -> str:
@@ -71,10 +132,30 @@ def _load_json_file(conn: sqlite3.Connection, path: Path) -> None:
     _insert_rows(conn, table_name, columns, records)
 
 
-def _load_csv_file(conn: sqlite3.Connection, path: Path) -> None:
+def _read_csv_headers(path: Path) -> list[str]:
+    """Read only the header row of a CSV file without loading all data."""
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        try:
+            return next(reader)
+        except StopIteration:
+            return []
+
+
+def _load_csv_file(
+    conn: sqlite3.Connection,
+    path: Path,
+    columns_to_load: list[str] | None = None,
+) -> None:
     with path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        records_str = list(reader)
+        if columns_to_load is not None:
+            records_str: list[Any] = [
+                {c: row[c] for c in columns_to_load if c in row}
+                for row in reader
+            ]
+        else:
+            records_str = list(reader)
 
     if not records_str:
         return
@@ -85,13 +166,18 @@ def _load_csv_file(conn: sqlite3.Connection, path: Path) -> None:
     _insert_rows(conn, table_name, columns, records_str)  # type: ignore[arg-type]
 
 
-def load_context_to_sqlite(context_dir: Path) -> sqlite3.Connection:
+def load_context_to_sqlite(
+    context_dir: Path,
+    question: str | None = None,
+) -> sqlite3.Connection:
     """Load all context files into a unified in-memory SQLite database.
 
     - CSV and JSON files are loaded directly into the main schema.
     - SQLite .db / .sqlite / .sqlite3 files are ATTACHed under an alias equal
       to their file stem (e.g. hero_power.db → schema alias 'hero_power').
       Tables from attached databases are addressed as <alias>.<table>.
+    - For CSV files larger than _LARGE_CSV_THRESHOLD_BYTES, only columns
+      relevant to *question* (plus structural/ID columns) are loaded.
 
     The result is cached per context_dir for the lifetime of the process so
     repeated calls within the same task subprocess pay the loading cost only once.
@@ -110,7 +196,12 @@ def load_context_to_sqlite(context_dir: Path) -> sqlite3.Connection:
 
     for csv_file in sorted(context_dir.rglob("*.csv")):
         try:
-            _load_csv_file(conn, csv_file)
+            columns_to_load: list[str] | None = None
+            if question and csv_file.stat().st_size > _LARGE_CSV_THRESHOLD_BYTES:
+                headers = _read_csv_headers(csv_file)
+                if headers:
+                    columns_to_load = _select_columns_for_large_csv(headers, question)
+            _load_csv_file(conn, csv_file, columns_to_load)
         except Exception:
             pass
 
@@ -138,12 +229,18 @@ def load_context_to_sqlite(context_dir: Path) -> sqlite3.Connection:
     return conn
 
 
-def load_raw_tables(context_dir: Path, max_rows: int | None = None) -> list[dict[str, Any]]:
+def load_raw_tables(
+    context_dir: Path,
+    max_rows: int | None = None,
+    question: str | None = None,
+) -> list[dict[str, Any]]:
     """Load JSON, CSV, and SQLite files from context as raw record dicts.
 
     max_rows caps the number of records per table (used by the schema profiler
     to avoid reading millions of rows just for type inference).
     Includes tables from .db / .sqlite / .sqlite3 files alongside CSV/JSON.
+    For CSV files larger than _LARGE_CSV_THRESHOLD_BYTES, only columns
+    relevant to *question* (plus structural/ID columns) are loaded.
     """
     raw: list[dict[str, Any]] = []
 
@@ -168,8 +265,20 @@ def load_raw_tables(context_dir: Path, max_rows: int | None = None) -> list[dict
 
     for csv_file in sorted(context_dir.rglob("*.csv")):
         try:
+            columns_to_load: list[str] | None = None
+            if question and csv_file.stat().st_size > _LARGE_CSV_THRESHOLD_BYTES:
+                headers = _read_csv_headers(csv_file)
+                if headers:
+                    columns_to_load = _select_columns_for_large_csv(headers, question)
             with csv_file.open(newline="", encoding="utf-8") as f:
-                records_str = list(islice(csv.DictReader(f), max_rows))
+                reader = csv.DictReader(f)
+                if columns_to_load is not None:
+                    records_str = [
+                        {c: row[c] for c in columns_to_load if c in row}
+                        for row in islice(reader, max_rows)
+                    ]
+                else:
+                    records_str = list(islice(reader, max_rows))
             if records_str:
                 raw.append({"table": csv_file.stem, "records": records_str})
         except Exception:

@@ -254,7 +254,11 @@ def build_context(database_name: str, raw_tables_input: list[dict]) -> dict[str,
     return context
 
 
-def build_schema_profile(context_dir: Path, sample_rows: int = 50000) -> dict[str, Any]:
+def build_schema_profile(
+    context_dir: Path,
+    sample_rows: int = 50000,
+    question: str | None = None,
+) -> dict[str, Any]:
     """Build a rich schema profile for all data sources in context_dir.
 
     Loads CSV/JSON/SQLite data, infers column types, detects primary/foreign
@@ -262,14 +266,18 @@ def build_schema_profile(context_dir: Path, sample_rows: int = 50000) -> dict[st
 
     Row counts are corrected against the true SQLite counts after profiling
     (sample_rows may have capped what was loaded for type inference).
+
+    If *question* is provided, large CSV files (> 20 MB) are column-pruned
+    to only load columns relevant to the question plus structural/ID columns,
+    reducing memory use and load time for wide tables.
     """
     from data_agent_baseline.tools.context_sqlite import load_raw_tables, load_context_to_sqlite
 
-    raw_tables = load_raw_tables(context_dir, max_rows=sample_rows)
+    raw_tables = load_raw_tables(context_dir, max_rows=sample_rows, question=question)
     result = build_context(context_dir.parent.name, raw_tables)
 
     # Overwrite row_count with the true count from the unified SQLite connection.
-    conn = load_context_to_sqlite(context_dir)
+    conn = load_context_to_sqlite(context_dir, question=question)
     for table_name in list(result["tables"].keys()):
         try:
             # Support both plain names (CSV/JSON) and alias.table (.db) names
