@@ -56,3 +56,6 @@ $RECYCLE.BIN/
 .dockerignore
 Dockerfile
 *team*.tar.gz
+
+# CLAUDE files
+.claude
