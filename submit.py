@@ -50,7 +50,10 @@ def main() -> None:
             output_dir=OUTPUT_DIR,
             run_id=_RUN_SUBDIR,
             max_workers=8,
-            task_timeout_seconds=600,
+            # 3 escalating attempts per task: 400 s → 600 s → 800 s.
+            # Resumptions are only triggered on max_steps exhaustion, not timeout.
+            task_timeout_seconds_per_attempt=(400, 600, 800),
+            preflight_timeout_seconds=30,
         ),
     )
 
@@ -65,12 +68,12 @@ def main() -> None:
             log.warning("no prediction for %s: %s", artifact.task_id, artifact.failure_reason)
 
     log.info(
-        "starting: input=%s output=%s model=%s workers=%d timeout=%ds",
+        "starting: input=%s output=%s model=%s workers=%d attempts=%s",
         INPUT_DIR,
         OUTPUT_DIR,
         model_name,
         config.run.max_workers,
-        config.run.task_timeout_seconds,
+        config.run.task_timeout_seconds_per_attempt,
     )
 
     _, artifacts = run_benchmark(config=config, progress_callback=on_task_complete)
