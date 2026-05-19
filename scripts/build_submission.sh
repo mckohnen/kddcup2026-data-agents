@@ -17,7 +17,7 @@ ARCHIVE="${TEAM_ID}_v${VERSION}.tar.gz"
 cd "$(dirname "$0")/.."
 
 echo "==> Building image: ${IMAGE}"
-docker build -t "${IMAGE}" .
+docker build --platform linux/amd64 -t "${IMAGE}" .
 
 echo "==> Saving to archive: ${ARCHIVE}"
 docker save "${IMAGE}" | gzip > "${ARCHIVE}"

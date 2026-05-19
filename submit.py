@@ -49,7 +49,7 @@ def main() -> None:
         run=RunConfig(
             output_dir=OUTPUT_DIR,
             run_id=_RUN_SUBDIR,
-            max_workers=8,
+            max_workers=4,
             # 3 escalating attempts per task: 400 s → 600 s → 800 s.
             # Resumptions are only triggered on max_steps exhaustion, not timeout.
             task_timeout_seconds_per_attempt=(400, 600, 800),
