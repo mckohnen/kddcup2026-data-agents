@@ -117,7 +117,7 @@ Step 4 — Query and analyse:
   Important SQL rules:
   - Multi-condition filtering on longitudinal data:
     Before writing any WHERE clause that combines two or more conditions on a
-    time-series table (e.g. "patient has normal WBC AND has abnormal FG"), read the
+    time-series table, read the
     DOMAIN ANALYSIS GUIDANCE block in the preflight hint. That block tells you whether
     the question calls for same-row (concurrent), any-row (independent), or temporal-
     proximity logic — the right approach depends on domain and question phrasing.
