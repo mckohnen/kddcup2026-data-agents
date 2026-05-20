@@ -324,7 +324,7 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
     return last_result
 
 
-def _write_task_outputs(task_id: str, run_output_dir: Path, run_result: dict[str, Any]) -> TaskRunArtifacts:
+def _write_task_outputs(task_id: str, run_output_dir: Path, run_result: dict[str, Any], *, keep_logs: bool = False) -> TaskRunArtifacts:
     task_output_dir = run_output_dir / task_id
     task_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -345,11 +345,10 @@ def _write_task_outputs(task_id: str, run_output_dir: Path, run_result: dict[str
             list(answer.get("columns", [])),
             [list(row) for row in answer.get("rows", [])],
         )
-        # Drop the log for tasks that completed successfully — keeps disk usage
-        # low across 367 tasks while preserving logs for failures that need debugging.
-        log_path = task_output_dir / "agent.log"
-        if log_path.exists():
-            log_path.unlink(missing_ok=True)
+        if not keep_logs:
+            log_path = task_output_dir / "agent.log"
+            if log_path.exists():
+                log_path.unlink(missing_ok=True)
 
     return TaskRunArtifacts(
         task_id=task_id,
@@ -384,7 +383,7 @@ def run_single_task(
     else:
         run_result = _run_single_task_core(task_id=task_id, config=config, model=model, tools=tools)
     run_result["e2e_elapsed_seconds"] = round(perf_counter() - started_at, 3)
-    return _write_task_outputs(task_id, run_output_dir, run_result)
+    return _write_task_outputs(task_id, run_output_dir, run_result, keep_logs=config.run.keep_logs)
 
 
 def run_benchmark(

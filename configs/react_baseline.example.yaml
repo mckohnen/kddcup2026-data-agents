@@ -46,6 +46,7 @@ run:
   #     # if ≥ 30 % finish on attempt 1: ≈ 11.5 h  (within 12 h limit)
   #
   task_timeout_seconds_per_attempt: [250, 500]
+  keep_logs: false  # if true, preserve agent.log even for successful tasks during dev
 
   # Legacy flat-timeout fields (used only when task_timeout_seconds_per_attempt is absent):
   # task_timeout_seconds: 600
