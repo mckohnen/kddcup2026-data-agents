@@ -98,6 +98,10 @@ Step 4 — Query and analyse:
     trust ALL rows it returns. Never discard or manually filter rows from the result
     based on subjective reasoning (e.g. "closer to the target value"). The query
     result IS the answer — submit every row it produces.
+  - Zero-row diagnosis: if a query with WHERE conditions returns 0 rows unexpectedly, do
+    NOT re-run the same query or rebuild it from scratch. In one step, run
+    `SELECT DISTINCT <col> FROM <table>` for each filtered column to confirm the actual
+    stored values, then fix exactly the condition that doesn't match and re-run once.
   - When a question asks for the 'type of X', GROUP BY the short categorical `type`
     column on the entity table (e.g. `event.type`, `category`), not by a description
     or name field. Type columns hold values like 'Meeting', 'Election', 'Purchase'.
@@ -109,6 +113,17 @@ Step 4 — Query and analyse:
   - "Average monthly X": compute AVG(X) over monthly-granularity rows, NOT SUM(X) / 12.
     If each row represents one month: SELECT AVG(value_col).
     If each row is a yearly total: SELECT AVG(yearly_col) / 12.
+  - Formula scope vs. question aggregation: before writing SQL, identify WHAT is being
+    averaged. Two distinct cases when a knowledge.md formula uses "Total" or "Sum":
+    (a) Temporal average — question asks for an average ACROSS TIME (e.g. "average monthly
+        for a year"): apply the formula to the whole group → SUM(group) / N is correct.
+    (b) Entity average — question asks for an average ACROSS ENTITIES (e.g. "average X
+        per customer / per product / per person"): compute the formula per entity in a
+        subquery, then AVG over entities in the outer query.
+    Do NOT default to case (a) just because the formula uses the word "Total". The
+    preflight "Metric hint" reflects the question's aggregation intent — use it as a
+    signal to distinguish (a) from (b). If the hint says AVG and the formula uses Total,
+    explicitly reason through which case applies before writing SQL.
   - Empty strings in CSV columns: CAST('' AS REAL) = 0 in SQLite, which silently distorts
     AVG and SUM. Always filter empty strings from numeric aggregations:
     WRONG: AVG(CAST(col AS REAL))                    -- '' treated as 0

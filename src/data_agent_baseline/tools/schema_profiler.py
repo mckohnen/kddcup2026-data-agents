@@ -49,8 +49,11 @@ def infer_type(values: list[Any]) -> str:
         return "unknown"
     if all(isinstance(v, bool) for v in non_null):
         return "boolean"
+    # String-encoded booleans (CSV columns storing 'true'/'false' as text) must NOT
+    # be typed as boolean — SQLite stores them as TEXT, so SQL `= true` returns 0 rows.
+    # Report as categorical so the agent uses `= 'true'` instead.
     if all(str(v).lower() in {"true", "false"} for v in non_null):
-        return "boolean"
+        return "categorical"
     if all(isinstance(v, int) and not isinstance(v, bool) for v in non_null):
         return "integer"
     if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in non_null):
@@ -67,7 +70,14 @@ def infer_type(values: list[Any]) -> str:
 
 def is_id_like(column_name: str) -> bool:
     col = column_name.lower()
-    return col == "id" or col.endswith("_id") or col.startswith("link_to_")
+    # CamelCase IDs (e.g. CustomerID, OrderID): ends with uppercase "ID" preceded by a
+    # lowercase letter. Avoids false positives on words like "valid" or "ANDROID".
+    camel_id = (
+        len(column_name) > 2
+        and column_name[-2:] == "ID"
+        and column_name[-3].islower()
+    )
+    return col == "id" or col.endswith("_id") or camel_id or col.startswith("link_to_")
 
 
 def is_primary_key_candidate(
