@@ -407,6 +407,59 @@ def _extract_relevant_knowledge(
     return knowledge_content  # fallback to full content
 
 
+_DOMAIN_EXPERT_SYSTEM_PROMPT = (
+    "You are a senior domain expert analyst. "
+    "Given a data analysis question and information about the dataset, identify the domain "
+    "and provide specific, actionable analysis guidance from an expert's perspective.\n\n"
+    "Focus especially on:\n"
+    "1. Multi-condition filtering on time-series/longitudinal data: does 'entity has condition A "
+    "AND condition B' mean both conditions must appear in the SAME ROW (concurrent/same-visit), "
+    "or can they appear in DIFFERENT ROWS (any independent record), or should they be "
+    "temporally proximate (within a reasonable window of each other)?\n"
+    "2. Domain-specific definitions: what 'normal', 'active', 'current', or other qualitative "
+    "terms mean in this context.\n"
+    "3. Data structure pitfalls an analyst unfamiliar with this domain might miss.\n\n"
+    "Output ONLY a JSON object — no preamble, no explanation outside it:\n"
+    "{\n"
+    '  "domain": "<e.g. clinical/medical | financial/business | sports | manufacturing | general>",\n'
+    '  "expert_role": "<e.g. clinical data analyst | financial controller | sports statistician>",\n'
+    '  "multi_condition_logic": "<same-row | any-row | temporal-proximity | unclear — ",'
+    " plus a one-sentence rationale>,\n"
+    '  "guidance": ["<bullet 1>", "<bullet 2>", "<bullet 3>"]\n'
+    "}\n\n"
+    "Maximum 3 guidance bullets. Be concise and specific to this question."
+)
+
+
+def _get_domain_expert_guidance(
+    question: str,
+    knowledge_content: str,
+    model: "ModelAdapter",
+) -> dict:
+    """Return domain-expert analysis guidance for the question.
+
+    Returns a dict with keys: domain, expert_role, multi_condition_logic, guidance.
+    Returns an empty dict on failure.
+    """
+    import json as _json
+    from data_agent_baseline.agents.model import ModelMessage  # noqa: PLC0415
+
+    context_block = knowledge_content[:2000] if knowledge_content else "(no knowledge document)"
+    prompt = f"Question: {question}\n\nDataset knowledge excerpt:\n{context_block}"
+
+    try:
+        raw = model.complete([
+            ModelMessage(role="system", content=_DOMAIN_EXPERT_SYSTEM_PROMPT),
+            ModelMessage(role="user", content=prompt),
+        ]).strip()
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
+        return _json.loads(raw)
+    except Exception:
+        return {}
+
+
 _DOC_SCAN_SYSTEM_PROMPT = (
     "You are a data analyst. You will be shown opening excerpts from one or more data documents. "
     "For each document, output exactly one line in the format:\n"
@@ -578,6 +631,15 @@ def build_task_analysis(
         except OSError:
             pass
 
+    # Domain expert guidance — one LLM call that adopts the appropriate domain persona
+    # and advises on multi-condition logic (same-row / any-row / temporal-proximity).
+    domain_guidance: dict = {}
+    if model is not None and knowledge_content:
+        try:
+            domain_guidance = _get_domain_expert_guidance(question, knowledge_content, model)
+        except Exception:
+            pass
+
     # Run coverage gap extraction — must come after _match_literal_values_sql above
     # which has already cached the SQLite connection.  The extractor injects
     # *_complete tables directly into that cached connection so the Analyst sees
@@ -634,6 +696,7 @@ def build_task_analysis(
         "knowledge_content": knowledge_content,
         "extracted_tables": extracted_tables,
         "_schema_tables": schema_tables,
+        "domain_guidance": domain_guidance,
     }
 
 
@@ -702,6 +765,19 @@ def format_task_analysis_hint(analysis: dict) -> str:
     m = analysis["metric"]
     if m["metric"] != "unknown":
         lines.append(f"Metric hint:        {m['metric'].upper()} ({m['aggregation']}) — verify in docs")
+
+    # Domain expert guidance — injected prominently so the agent reads it before querying.
+    dg = analysis.get("domain_guidance", {})
+    if dg:
+        role = dg.get("expert_role", dg.get("domain", "domain expert"))
+        mc_logic = dg.get("multi_condition_logic", "")
+        guidance_bullets = dg.get("guidance", [])
+        lines.append(f"\nDOMAIN ANALYSIS GUIDANCE (perspective: {role}):")
+        if mc_logic:
+            lines.append(f"  Multi-condition logic: {mc_logic}")
+        for bullet in guidance_bullets:
+            lines.append(f"  • {bullet}")
+        lines.append("")  # blank line after block
 
     # Extracted tables: show prominently; suppress raw coverage warning for handled gaps.
     extracted = analysis.get("extracted_tables", [])

@@ -115,21 +115,14 @@ Step 4 — Query and analyse:
     or query_context_tables using that value. Repeating the same search wastes steps.
 
   Important SQL rules:
-  - Multi-condition patient filtering (each condition may appear in DIFFERENT rows):
-    When a question asks for patients who satisfy condition A AND condition B (e.g. "has
-    normal WBC AND has abnormal FG"), NEVER combine both into a single WHERE clause —
-    that requires both to be non-null in the SAME ROW and will silently miss patients whose
-    measurements were taken on different dates. Always use separate subqueries:
-    WRONG:
-      WHERE CAST(WBC AS REAL) BETWEEN 3.5 AND 9.0
-        AND FG != '' AND CAST(FG AS REAL) < 150
-    RIGHT:
-      WHERE ID IN (SELECT ID FROM Laboratory WHERE WBC != ''
-                   AND CAST(WBC AS REAL) BETWEEN 3.5 AND 9.0)
-        AND ID IN (SELECT ID FROM Laboratory WHERE FG != ''
-                   AND CAST(FG AS REAL) < 150)
-    This rule applies to any multi-condition filter on longitudinal (time-series) data where
-    measurements may be recorded on separate visits.
+  - Multi-condition filtering on longitudinal data:
+    Before writing any WHERE clause that combines two or more conditions on a
+    time-series table (e.g. "patient has normal WBC AND has abnormal FG"), read the
+    DOMAIN ANALYSIS GUIDANCE block in the preflight hint. That block tells you whether
+    the question calls for same-row (concurrent), any-row (independent), or temporal-
+    proximity logic — the right approach depends on domain and question phrasing.
+    Never combine independent conditions into a single WHERE clause without considering
+    whether the measurements must co-occur on the same date.
   - CSV columns are stored as TEXT — ALWAYS use CAST for numeric comparisons and arithmetic.
     WRONG: WHERE height_cm > 200          (text comparison: '61' > '200' is TRUE!)
     RIGHT:  WHERE CAST(height_cm AS INTEGER) > 200
