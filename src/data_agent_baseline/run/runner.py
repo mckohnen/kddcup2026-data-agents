@@ -112,6 +112,17 @@ def _resolve_attempt_timeouts(run_config) -> list[int]:
     return [run_config.task_timeout_seconds] * (1 + max(0, run_config.max_resumptions))
 
 
+def _is_resumable_failure(failure_reason: str) -> bool:
+    """Return True when a failed attempt should trigger a fresh resumption attempt.
+
+    Normal step-exhaustion and content-filter stops are both resumable: they
+    produced useful work that the next attempt can build on via the summary.
+    Timeouts and crashes are not resumable — no useful trace to summarise.
+    """
+    reason_lower = failure_reason.lower()
+    return "max_steps" in reason_lower or "content_filter_triggered" in reason_lower
+
+
 def _run_one_attempt_core(
     *,
     task_id: str,
@@ -120,11 +131,16 @@ def _run_one_attempt_core(
     is_first_attempt: bool = True,
     model=None,
     tools: ToolRegistry | None = None,
+    override_max_steps: int | None = None,
 ) -> dict[str, Any]:
     """Run a SINGLE agent attempt (no internal resumption loop).
 
     Returns the attempt result dict including ``preflight``, ``input_tokens``,
     and ``output_tokens`` keys that the caller may pop before writing the trace.
+
+    ``override_max_steps`` is used when a content-filter stop cut a prior attempt
+    short — the next attempt receives only the *remaining* step budget so the
+    total across both attempts stays at ``config.agent.max_steps``.
     """
     public_dataset = DABenchPublicDataset(config.dataset.root_path)
     task = public_dataset.get_task(task_id)
@@ -134,9 +150,10 @@ def _run_one_attempt_core(
     # Only run preflight on the first attempt.  Resumptions already receive the
     # schema via the prior_summaries block, so re-running preflight wastes budget.
     preflight_secs = config.run.preflight_timeout_seconds if is_first_attempt else 0
+    effective_max_steps = override_max_steps if override_max_steps is not None else config.agent.max_steps
     agent = DataAgent(
         model=model_instance,
-        max_steps=config.agent.max_steps,
+        max_steps=effective_max_steps,
         preflight_timeout_seconds=preflight_secs,
     )
 
@@ -147,6 +164,30 @@ def _run_one_attempt_core(
     run_result["input_tokens"] = getattr(model_instance, "total_input_tokens", 0)
     run_result["output_tokens"] = getattr(model_instance, "total_output_tokens", 0)
     return run_result
+
+
+def _remaining_steps(
+    run_result: dict[str, Any],
+    config: AppConfig,
+    current_override: int | None = None,
+) -> int | None:
+    """Compute remaining step budget after a content-filter stop.
+
+    Returns None for max_steps exhaustion (full budget applies to next attempt).
+    For content-filter stops, returns max(slot_budget - steps_consumed, 4) so the
+    recovery attempt only uses what's left in the current slot, with a floor of 4
+    to ensure the agent always has room to run a query and submit.
+
+    ``current_override`` is the step budget that was given to the current attempt
+    (None means the global max_steps was used).  This keeps chained recoveries
+    within a single official slot's total budget.
+    """
+    if "content_filter_triggered" not in run_result.get("failure_reason", ""):
+        return None
+    steps_consumed = len(run_result.get("steps", []))
+    slot_budget = current_override if current_override is not None else config.agent.max_steps
+    remaining = slot_budget - steps_consumed
+    return max(remaining, 4)
 
 
 def _run_single_task_core(
@@ -160,24 +201,35 @@ def _run_single_task_core(
 
     This path is only taken in single-worker / test mode.  Production runs go
     through ``_run_single_task_with_timeout`` which spawns a subprocess per attempt.
+
+    Content-filter stops get a free recovery attempt (same official slot, remaining
+    step budget) rather than consuming a resumption slot.  Only max_steps exhaustion
+    advances to the next official slot.
     """
-    attempt_timeouts = _resolve_attempt_timeouts(config.run)
+    official_slot_count = len(_resolve_attempt_timeouts(config.run))
     prior_summaries: list[str] = []
     cumulative_input = 0
     cumulative_output = 0
     preflight_saved = False
     run_result: dict[str, Any] = _failure_run_result_payload(task_id, "No attempts were made.")
+    override_steps: int | None = None
+    official_slot_idx = 0
+    total_attempt_idx = 0
+    _MAX_FILTER_RECOVERIES = 5  # safety cap: avoid infinite content-filter loops
 
-    for attempt_idx in range(len(attempt_timeouts)):
+    consecutive_filter_stops = 0
+
+    while official_slot_idx < official_slot_count:
         log_path = Path(str(config.run.output_dir)) / config.run.run_id / task_id / "agent.log"
-        setup_task_logger(log_path, attempt=attempt_idx + 1)
+        setup_task_logger(log_path, attempt=total_attempt_idx + 1)
         run_result = _run_one_attempt_core(
             task_id=task_id,
             config=config,
             prior_summaries=prior_summaries,
-            is_first_attempt=(attempt_idx == 0),
+            is_first_attempt=(total_attempt_idx == 0),
             model=model,
             tools=tools,
+            override_max_steps=override_steps,
         )
         cumulative_input += run_result.pop("input_tokens", 0)
         cumulative_output += run_result.pop("output_tokens", 0)
@@ -189,11 +241,25 @@ def _run_single_task_core(
 
         if run_result.get("answer") is not None:
             break
+
         failure_reason = run_result.get("failure_reason", "")
-        if "max_steps" not in failure_reason.lower():
+        if not _is_resumable_failure(failure_reason):
             break
-        if attempt_idx < len(attempt_timeouts) - 1:
-            prior_summaries.append(summarise_trace_for_resumption(run_result))
+
+        is_filter_stop = "content_filter_triggered" in failure_reason
+        prior_summaries.append(summarise_trace_for_resumption(run_result))
+
+        if is_filter_stop and consecutive_filter_stops < _MAX_FILTER_RECOVERIES:
+            # Recovery attempt: stay on the same official slot, consume remaining steps.
+            consecutive_filter_stops += 1
+            override_steps = _remaining_steps(run_result, config, current_override=override_steps)
+        else:
+            # max_steps exhaustion (or filter recovery cap): advance to next official slot.
+            consecutive_filter_stops = 0
+            official_slot_idx += 1
+            override_steps = None
+
+        total_attempt_idx += 1
 
     run_result["input_tokens"] = cumulative_input
     run_result["output_tokens"] = cumulative_output
@@ -206,6 +272,7 @@ def _run_one_attempt_in_subprocess(
     prior_summaries: list[str],
     attempt_idx: int,
     queue: multiprocessing.Queue[Any],
+    override_max_steps: int | None = None,
 ) -> None:
     log_path = Path(str(config.run.output_dir)) / config.run.run_id / task_id / "agent.log"
     setup_task_logger(log_path, attempt=attempt_idx + 1)
@@ -218,6 +285,7 @@ def _run_one_attempt_in_subprocess(
                     config=config,
                     prior_summaries=prior_summaries,
                     is_first_attempt=(attempt_idx == 0),
+                    override_max_steps=override_max_steps,
                 ),
             }
         )
@@ -228,32 +296,38 @@ def _run_one_attempt_in_subprocess(
 
 
 def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[str, Any]:
-    """Run a task with per-attempt escalating wall-clock timeouts.
+    """Run a task with per-attempt wall-clock timeouts in separate subprocesses.
 
-    Each attempt runs in its own subprocess so the timeout is enforced reliably.
     The preflight budget is added on top of the first attempt's agent budget only.
 
-    Resumptions are only triggered when an attempt exhausted ``max_steps`` — a
-    timeout or crash is not retried (the subprocess was already killed / gave up).
+    Content-filter stops get a free recovery attempt (same official slot, remaining
+    step budget) rather than consuming a resumption slot.  Only max_steps exhaustion
+    advances to the next official slot.  Timeouts and crashes are not resumable.
     """
     attempt_timeouts = _resolve_attempt_timeouts(config.run)
     preflight_budget = config.run.preflight_timeout_seconds
+    _MAX_FILTER_RECOVERIES = 5  # safety cap: avoid infinite content-filter loops
 
     prior_summaries: list[str] = []
     cumulative_input = 0
     cumulative_output = 0
     preflight_result: dict = {}
     last_result: dict[str, Any] = _failure_run_result_payload(task_id, "No attempts were made.")
+    override_max_steps: int | None = None
+    official_slot_idx = 0
+    total_attempt_idx = 0
+    consecutive_filter_stops = 0
 
-    for attempt_idx, attempt_timeout in enumerate(attempt_timeouts):
+    while official_slot_idx < len(attempt_timeouts):
+        attempt_timeout = attempt_timeouts[official_slot_idx]
         # First attempt: add preflight budget.  Resumptions skip preflight.
-        subprocess_budget = attempt_timeout + (preflight_budget if attempt_idx == 0 else 0)
+        subprocess_budget = attempt_timeout + (preflight_budget if total_attempt_idx == 0 else 0)
 
         ctx = multiprocessing.get_context("spawn")
         queue: multiprocessing.Queue[Any] = ctx.Queue()
         process = ctx.Process(
             target=_run_one_attempt_in_subprocess,
-            args=(task_id, config, prior_summaries, attempt_idx, queue),
+            args=(task_id, config, prior_summaries, total_attempt_idx, queue, override_max_steps),
         )
         process.start()
         process.join(subprocess_budget)
@@ -266,14 +340,14 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
                 process.join()
             run_result = _failure_run_result_payload(
                 task_id,
-                f"Attempt {attempt_idx + 1} timed out after {subprocess_budget}s.",
+                f"Attempt {total_attempt_idx + 1} timed out after {subprocess_budget}s.",
             )
         elif queue.empty():
             exit_code = process.exitcode
             msg = (
-                f"Attempt {attempt_idx + 1} exited unexpectedly (code {exit_code})."
+                f"Attempt {total_attempt_idx + 1} exited unexpectedly (code {exit_code})."
                 if exit_code not in (None, 0)
-                else f"Attempt {attempt_idx + 1} exited without returning a result."
+                else f"Attempt {total_attempt_idx + 1} exited without returning a result."
             )
             run_result = _failure_run_result_payload(task_id, msg)
         else:
@@ -282,14 +356,14 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
                 run_result = dict(item["run_result"])
                 cumulative_input += run_result.pop("input_tokens", 0)
                 cumulative_output += run_result.pop("output_tokens", 0)
-                if attempt_idx == 0:
+                if total_attempt_idx == 0:
                     preflight_result = run_result.pop("preflight", {})
                 else:
                     run_result.pop("preflight", None)
             else:
                 run_result = _failure_run_result_payload(
                     task_id,
-                    f"Attempt {attempt_idx + 1} failed with uncaught error: {item.get('error', 'unknown')}",
+                    f"Attempt {total_attempt_idx + 1} failed with uncaught error: {item.get('error', 'unknown')}",
                 )
 
         last_result = run_result
@@ -298,25 +372,37 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
         if run_result.get("answer") is not None:
             break
 
-        # Only resume after step-exhaustion, not after timeout/crash.
+        # Resume after step-exhaustion or content-filter stop.
+        # Timeouts and crashes are not resumable — the trace is incomplete.
         failure_reason = run_result.get("failure_reason", "")
-        if "max_steps" not in failure_reason.lower():
+        if not _is_resumable_failure(failure_reason):
             break
 
-        # Prepare summary for the next attempt (if one remains).
-        if attempt_idx < len(attempt_timeouts) - 1:
-            summary = summarise_trace_for_resumption(run_result)
-            prior_summaries.append(summary)
-            # Persist the intermediate attempt trace and resumption summary so
-            # they can be inspected for debugging even if the final attempt
-            # succeeds (and overwrites trace.json).
-            task_output_dir = Path(config.run.output_dir) / config.run.run_id / task_id
-            task_output_dir.mkdir(parents=True, exist_ok=True)
-            attempt_num = attempt_idx + 1
-            _write_json(task_output_dir / f"trace_attempt_{attempt_num}.json", run_result)
-            (task_output_dir / f"resumption_summary_{attempt_num}.txt").write_text(
-                summary, encoding="utf-8"
+        is_filter_stop = "content_filter_triggered" in failure_reason
+        summary = summarise_trace_for_resumption(run_result)
+        prior_summaries.append(summary)
+
+        # Persist intermediate trace + summary for debugging.
+        task_output_dir = Path(config.run.output_dir) / config.run.run_id / task_id
+        task_output_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(task_output_dir / f"trace_attempt_{total_attempt_idx + 1}.json", run_result)
+        (task_output_dir / f"resumption_summary_{total_attempt_idx + 1}.txt").write_text(
+            summary, encoding="utf-8"
+        )
+
+        if is_filter_stop and consecutive_filter_stops < _MAX_FILTER_RECOVERIES:
+            # Recovery attempt: stay on same official slot, use remaining steps.
+            consecutive_filter_stops += 1
+            override_max_steps = _remaining_steps(
+                run_result, config, current_override=override_max_steps
             )
+        else:
+            # max_steps exhaustion (or filter cap): advance to next official slot.
+            consecutive_filter_stops = 0
+            official_slot_idx += 1
+            override_max_steps = None
+
+        total_attempt_idx += 1
 
     last_result["preflight"] = preflight_result
     last_result["input_tokens"] = cumulative_input

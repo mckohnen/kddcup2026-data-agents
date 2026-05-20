@@ -290,6 +290,75 @@ def _infer_joins(candidate_tables: list[str], context: dict) -> list[dict]:
 # Public API
 # ---------------------------------------------------------------------------
 
+def _check_id_coverage(context: dict, context_dir: "Path") -> list[dict]:
+    """Detect lookup tables whose IDs don't fully cover the related fact tables.
+
+    A lookup table is a small table (≤ 300 rows, ≤ 4 columns) with a single ID
+    column that shares a name with columns in larger tables.  When coverage is
+    incomplete (< 95%) the agent should look for supplementary data in prose docs.
+
+    Returns a list of warning dicts, one per incomplete join found.
+    """
+    from data_agent_baseline.tools.context_sqlite import run_sql_on_context
+
+    tables = context.get("tables", {})
+    if not tables:
+        return []
+
+    # Separate small (lookup) from large (fact) tables by row count
+    small_tables = {
+        name: info for name, info in tables.items()
+        if info.get("row_count", 0) <= 300
+        and len(info.get("columns", [])) <= 4
+        and not name.endswith("_paragraphs")
+    }
+    large_tables = {
+        name: info for name, info in tables.items()
+        if info.get("row_count", 0) > 300
+        and not name.endswith("_paragraphs")
+    }
+
+    if not small_tables or not large_tables:
+        return []
+
+    warnings: list[dict] = []
+    for small_name, small_info in small_tables.items():
+        small_cols = list(small_info.get("columns", {}).keys())
+        if not small_cols:
+            continue
+        id_col = small_cols[0]  # first column is typically the ID
+
+        for large_name, large_info in large_tables.items():
+            large_col_names = list(large_info.get("columns", {}).keys())
+            if id_col not in large_col_names:
+                continue
+
+            large_count = large_info.get("row_count", 0)
+            if large_count == 0:
+                continue
+
+            # Count how many distinct IDs in the large table are missing from the lookup
+            try:
+                result = run_sql_on_context(
+                    context_dir,
+                    f'SELECT COUNT(DISTINCT "{id_col}") FROM "{large_name}" '
+                    f'WHERE "{id_col}" NOT IN (SELECT "{id_col}" FROM "{small_name}")',
+                    limit=1,
+                )
+                missing = (result.get("rows") or [[0]])[0][0]
+                if isinstance(missing, int) and missing > 0:
+                    warnings.append({
+                        "lookup_table": small_name,
+                        "lookup_id_col": id_col,
+                        "fact_table": large_name,
+                        "missing_ids": missing,
+                    })
+            except Exception:
+                pass  # Never let coverage check crash the preflight
+
+    return warnings
+
+
 def build_task_analysis(
     question: str,
     context: dict,
@@ -308,7 +377,7 @@ def build_task_analysis(
     Returns:
         Dict with keys: ``matched_terms``, ``candidate_tables``,
         ``candidate_columns``, ``required_joins``, ``filter_candidates``,
-        ``metric``.
+        ``metric``, ``coverage_warnings``.
     """
     table_matches = _match_tables(question, context)
     column_matches = _match_columns(question, context)
@@ -340,6 +409,8 @@ def build_task_analysis(
         for m in value_matches
     ]
 
+    coverage_warnings = _check_id_coverage(context, context_dir)
+
     return {
         "question": question,
         "matched_terms": all_matches,
@@ -348,6 +419,8 @@ def build_task_analysis(
         "required_joins": _infer_joins(candidate_tables, context),
         "filter_candidates": filter_candidates,
         "metric": _infer_metric(question),
+        "coverage_warnings": coverage_warnings,
+        "_schema_tables": list(context.get("tables", {}).keys()),
     }
 
 
@@ -407,5 +480,26 @@ def format_task_analysis_hint(analysis: dict) -> str:
     m = analysis["metric"]
     if m["metric"] != "unknown":
         lines.append(f"Metric hint:        {m['metric'].upper()} ({m['aggregation']}) — verify in docs")
+
+    for w in analysis.get("coverage_warnings", []):
+        lines.append(
+            f"DATA COVERAGE WARNING: '{w['lookup_table']}' covers only some IDs in "
+            f"'{w['fact_table']}' — {w['missing_ids']} distinct {w['lookup_id_col']} values "
+            f"in '{w['fact_table']}' are NOT in '{w['lookup_table']}'. "
+            f"Check prose doc files for additional '{w['lookup_id_col']}' attribute data "
+            f"and parse it to build a complete lookup before filtering."
+        )
+
+    # Detect all-docs mode: only *_paragraphs tables are present
+    all_tables = analysis.get("candidate_tables", [])
+    context_schema = analysis.get("_schema_tables", [])
+    if context_schema and all(t.endswith("_paragraphs") for t in context_schema):
+        lines.append(
+            "ALL-DOCS MODE: show_context_schema has ONLY *_paragraphs tables — "
+            "ALL structured data is embedded in prose documents. "
+            "Use execute_python with regex to extract patient/entity IDs and values from "
+            "the full doc files. Do NOT rely on search_doc for data extraction. "
+            "See ALL-DOCS MODE instructions in the system prompt."
+        )
 
     return "\n".join(lines)

@@ -4,7 +4,7 @@ import re
 import threading
 from datetime import datetime
 
-from data_agent_baseline.agents.model import ModelAdapter
+from data_agent_baseline.agents.model import ModelAdapter, ModelMessage
 from data_agent_baseline.agents.react import ReActAgent, ReActAgentConfig
 from data_agent_baseline.task_logger import get_logger
 from data_agent_baseline.benchmark.schema import AnswerTable, PublicTask
@@ -65,11 +65,39 @@ Step 3 — Inspect schema and consider ALL data sources:
   question. If one data source returns no results, look in the others before giving up.
   Call show_context_schema to see all tables, columns, row counts, type hints, and inferred
   relationships. ALL data sources are unified in one SQLite connection:
+
+  Data completeness check (do this before writing filter queries):
+  If the question requires filtering by an attribute (sex, status, type, category) and there
+  is a small lookup table providing that attribute, verify that the lookup table covers all
+  IDs in the fact table before filtering. Run:
+    SELECT COUNT(*) FROM fact_table WHERE id_col NOT IN (SELECT id_col FROM lookup_table)
+  If the coverage gap is > 0, the lookup table is INCOMPLETE. Check prose documents
+  (patient_paragraphs, entity_paragraphs, etc.) for the missing attribute data. Use
+  execute_python to parse the relevant doc file and extract the attribute for the missing
+  IDs. Build a complete attribute set by combining the CSV lookup table with the parsed
+  prose data before running the final filter query.
   - CSV and JSON files → accessible as plain table names (e.g. SELECT * FROM atom)
   - SQLite .db files   → accessible as <db_stem>.<table> (e.g. SELECT * FROM hero_power.hero_power)
   - Large prose doc/*.md files → indexed as <filename_stem>_paragraphs(paragraph_idx INTEGER, content TEXT)
     Use SQL LIKE to search them: SELECT content FROM <stem>_paragraphs WHERE content LIKE '%term%'
   You can JOIN across all sources in a single SQL query.
+
+  ALL-DOCS MODE: If show_context_schema reveals ONLY *_paragraphs tables (no CSV/JSON/DB
+  tables), ALL structured data is embedded in prose documents. In this mode:
+  1. Do NOT rely on search_doc for data extraction — it returns snippets, not complete records.
+  2. Use execute_python to read the full document files and extract structured data with regex.
+     Process paragraph by paragraph. Extract patient IDs + values into a Python dict/list.
+  3. Once you have extracted the data into Python variables, compute the answer in Python.
+  4. Do NOT spend more than 2 steps on keyword searches before switching to execute_python.
+  Example pattern for prose data extraction:
+    import re
+    with open('doc/Laboratory.md', 'r') as f: content = f.read()
+    # split by paragraph, extract patient_id + numeric value per paragraph
+    records = []
+    for para in content.split('\n\n'):
+        pid = re.search(r'patient (\d+)', para, re.IGNORECASE)
+        val = re.search(r'creatinine.*?(\d+\.\d+) mg/dL', para, re.IGNORECASE)
+        if pid and val: records.append({'id': pid.group(1), 'cre': float(val.group(1))})
   CRITICAL: Do NOT run "SELECT name FROM sqlite_master WHERE type='table'" or any query
   against sqlite_master / sqlite_schema to discover tables. That system table only shows
   the main (CSV/JSON) schema and will NOT list .db tables. Always trust show_context_schema
@@ -131,13 +159,22 @@ Step 4 — Query and analyse:
     a "no such table" error — the data may live in a doc file.
   - Standard domain thresholds: first search ALL context files (knowledge.md, every doc/,
     every CSV header, every table) for explicitly defined thresholds. Only if none are
-    found anywhere in the context, fall back to your training knowledge of well-known
+    found anywhere in the context, use consult_domain_knowledge to retrieve well-known
     reference values (e.g. clinical normal ranges, physical constants, industry standards).
-    When using training knowledge, state in your thought exactly which values you assumed
-    and confirm no definition was found in the context.
-    IMPORTANT: if you have already made 2 or more doc/knowledge searches for a threshold
-    and found nothing, treat the search as exhausted — do NOT repeat the same search.
-    Immediately apply standard domain knowledge values and proceed to your SQL query.
+    IMPORTANT: if you have already made 5 or more doc/knowledge searches for the same
+    threshold and found nothing, treat the search as exhausted — do NOT repeat the same search.
+    Call consult_domain_knowledge immediately with a precise question about the threshold.
+    After receiving a threshold from consult_domain_knowledge, ALWAYS verify units by
+    running SELECT MIN(col), MAX(col), AVG(col) on the actual data column first. The
+    general knowledge threshold may be in different units than the dataset (e.g. cells/µL
+    vs ×10⁹/L). Scale the threshold to match what you observe in the data before filtering.
+
+    COMMIT RULE: If after 10 steps total you still do not have an answer, stop searching
+    and commit to your best estimate. An imperfect answer always scores better than no answer
+    (no answer = 0 score). Use whatever evidence you have: domain knowledge thresholds,
+    partial data ranges, or the most defensible assumption. Submit an answer even if uncertain.
+    If you know the upper limit but not the lower limit of a normal range, use just the upper
+    limit (e.g. creatinine > 1.2 mg/dL = abnormal) — partial criteria beat no answer.
 
   For exhaustive entity extraction from prose documents (e.g. listing every patient whose
   label is X, collecting all values of a field across a large Markdown file), use
@@ -307,23 +344,71 @@ def _get_current_datetime(_: PublicTask, action_input: dict) -> ToolExecutionRes
     })
 
 
-def _search_doc(task: PublicTask, action_input: dict) -> ToolExecutionResult:
-    from data_agent_baseline.tools.filesystem import resolve_context_path
-    path = str(action_input["path"])
-    keyword = str(action_input["keyword"]).lower()
-    max_results = int(action_input.get("max_results", 10))
+def _parse_exhausted_searches(prior_summaries: list[str]) -> set[tuple[str, str]]:
+    """Extract (path, keyword) pairs that returned 0 results in prior attempts.
 
-    full_path = resolve_context_path(task, path)
-    text = full_path.read_text(encoding="utf-8", errors="replace")
+    These are hard-blocked in _search_doc so the agent cannot waste steps
+    repeating searches that are already known to be empty.
+    """
+    blocked: set[tuple[str, str]] = set()
+    for summary in prior_summaries:
+        in_block = False
+        for line in summary.splitlines():
+            if "ALREADY DONE with ZERO results" in line:
+                in_block = True
+                continue
+            if in_block:
+                # Lines look like: "  keyword='foo' in doc/Bar.md"
+                m = re.match(r"\s+keyword='(.+)' in (.+)", line)
+                if m:
+                    blocked.add((m.group(2).strip(), m.group(1).strip().lower()))
+                elif line.strip() and not line.startswith(" "):
+                    in_block = False
+    return blocked
 
-    paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
-    matches = [p for p in paragraphs if keyword in p.lower()]
-    return ToolExecutionResult(ok=True, content={
-        "keyword": keyword,
-        "total_matches": len(matches),
-        "showing": min(max_results, len(matches)),
-        "results": matches[:max_results],
-    })
+
+def _make_search_doc(task: PublicTask, blocked_searches: set[tuple[str, str]]):
+    """Factory returning a _search_doc closure with pre-blocked exhausted searches."""
+    def _search_doc_impl(action_input: dict) -> ToolExecutionResult:
+        from data_agent_baseline.tools.filesystem import resolve_context_path
+        path = str(action_input["path"])
+        keyword = str(action_input["keyword"]).lower()
+        max_results = int(action_input.get("max_results", 10))
+
+        # Warn (not hard-error) for searches that already returned 0 results.
+        # Returning ok=True keeps the model in a healthy JSON-generation state;
+        # ok=False can cause the model to spiral into malformed-output loops.
+        if (path, keyword) in blocked_searches:
+            return ToolExecutionResult(ok=True, content={
+                "keyword": keyword,
+                "total_matches": 0,
+                "showing": 0,
+                "results": [],
+                "warning": (
+                    f"This search (keyword='{keyword}' in {path}) was already performed "
+                    "in a prior attempt and returned 0 results. Do NOT repeat it — "
+                    "try a different keyword or use execute_python to read the full file."
+                ),
+            })
+
+        full_path = resolve_context_path(task, path)
+        if full_path.is_dir():
+            files = sorted(f.name for f in full_path.iterdir() if f.is_file())
+            return ToolExecutionResult(ok=False, content={
+                "error": f"'{path}' is a directory, not a file. Specify a file path.",
+                "files_in_directory": files,
+            })
+        text = full_path.read_text(encoding="utf-8", errors="replace")
+
+        paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+        matches = [p for p in paragraphs if keyword in p.lower()]
+        return ToolExecutionResult(ok=True, content={
+            "keyword": keyword,
+            "total_matches": len(matches),
+            "showing": min(max_results, len(matches)),
+            "results": matches[:max_results],
+        })
+    return _search_doc_impl
 
 
 def _answer(_: PublicTask, action_input: dict) -> ToolExecutionResult:
@@ -450,7 +535,8 @@ _TOOL_HANDLERS = {
     "list_context": _list_context,
     "read_doc": _read_doc,
     "read_knowledge_section": _read_knowledge_section,
-    "search_doc": _search_doc,
+    # search_doc is NOT included here — it's created per-task via _make_search_doc
+    # to allow per-attempt blocked search sets.  See create_data_agent_tool_registry.
     "show_context_schema": _show_context_schema,
     "query_context_tables": _query_context_tables,
     "execute_python": _execute_python,
@@ -458,15 +544,98 @@ _TOOL_HANDLERS = {
 }
 
 
-def create_data_agent_tool_registry(input_files: dict | None = None) -> ToolRegistry:
+_DOMAIN_KNOWLEDGE_SYSTEM_PROMPT = (
+    "You are a factual domain knowledge assistant. "
+    "Answer the question using your training knowledge — be specific and concise. "
+    "If the answer involves a numeric threshold or range, state it explicitly in standard units. "
+    "If values genuinely vary by context (age, sex, laboratory), mention the most commonly "
+    "cited clinical reference range. "
+    "If you are uncertain, say so explicitly rather than guessing."
+)
+
+
+def create_data_agent_tool_registry(
+    input_files: dict | None = None,
+    model: ModelAdapter | None = None,
+    task: "PublicTask | None" = None,
+    blocked_searches: "set[tuple[str, str]] | None" = None,
+) -> ToolRegistry:
     """Return the unified tool registry.
 
     All tools are always active — the unified SQLite handles CSV, JSON, and .db
     sources transparently, so no per-file-type routing is needed.
     The ``input_files`` parameter is kept for backwards compatibility but ignored.
+    Pass ``model`` to enable the ``consult_domain_knowledge`` tool.
+    Pass ``blocked_searches`` (a set of (path, keyword) pairs that returned 0 results
+    in prior attempts) to hard-block those searches and prevent repetition.
     """
     del input_files  # no longer used
-    return ToolRegistry(specs=_TOOL_SPECS, handlers=_TOOL_HANDLERS)
+
+    specs = dict(_TOOL_SPECS)
+    handlers = dict(_TOOL_HANDLERS)
+
+    # search_doc is wired here (not in _TOOL_HANDLERS) so we can inject the
+    # per-attempt blocked-search set that prevents repeating 0-result queries.
+    _blocked = blocked_searches or set()
+    if task is not None:
+        _search_impl = _make_search_doc(task, _blocked)
+        handlers["search_doc"] = lambda _task, ai: _search_impl(ai)
+    else:
+        # Fallback: no task context, create a minimal closure that just calls the raw impl.
+        # In practice task is always provided; this guards against test callers.
+        handlers["search_doc"] = lambda _task, ai: ToolExecutionResult(
+            ok=False, content={"error": "search_doc requires task context."}
+        )
+
+    if model is not None:
+        def _consult_domain_knowledge(_task: PublicTask, action_input: dict) -> ToolExecutionResult:
+            question = str(action_input.get("question", "")).strip()
+            if not question:
+                return ToolExecutionResult(ok=False, content={"error": "'question' is required."})
+            log = get_logger()
+            log.info("  DOMAIN_KNOWLEDGE query=%r", question[:120])
+            try:
+                answer = model.complete([
+                    ModelMessage(role="system", content=_DOMAIN_KNOWLEDGE_SYSTEM_PROMPT),
+                    ModelMessage(role="user", content=question),
+                ])
+                log.info("  DOMAIN_KNOWLEDGE answer=%r", answer[:120])
+                return ToolExecutionResult(
+                    ok=True,
+                    content={
+                        "answer": answer.strip(),
+                        "source": "model_training_knowledge",
+                        "next_step": (
+                            "IMPORTANT: before applying any threshold from this answer, run "
+                            "SELECT MIN(col), MAX(col), AVG(col) on the actual data column "
+                            "to verify the units match. Scale the threshold if needed."
+                        ),
+                    },
+                )
+            except Exception as exc:
+                return ToolExecutionResult(ok=False, content={"error": str(exc)})
+
+        specs["consult_domain_knowledge"] = ToolSpec(
+            name="consult_domain_knowledge",
+            description=(
+                "Query the model's training knowledge about a factual domain question — "
+                "e.g. standard lab reference ranges, clinical thresholds, or well-known "
+                "constants that are not explicitly defined in the context files. "
+                "Use this ONLY after 5 or more searches of knowledge.md and doc/ files "
+                "have not yielded a definitive threshold or value. Do NOT use it as a "
+                "first resort — always check the context first. "
+                "CRITICAL: after receiving the answer, immediately verify units by running "
+                "SELECT MIN(col), MAX(col), AVG(col) on the relevant data column. "
+                "General knowledge thresholds may be in different units than the dataset "
+                "(e.g. cells/µL vs ×10⁹/L, g/dL vs g/L). Scale to match the data before filtering. "
+                "The answer reflects general knowledge and may vary by population; treat it as "
+                "a starting point, not ground truth."
+            ),
+            input_schema={"question": "What is the normal range for creatinine in mg/dL?"},
+        )
+        handlers["consult_domain_knowledge"] = _consult_domain_knowledge
+
+    return ToolRegistry(specs=specs, handlers=handlers)
 
 
 # ---------------------------------------------------------------------------
@@ -486,16 +655,22 @@ def summarise_trace_for_resumption(trace_dict: dict) -> str:
     """
     steps = trace_dict.get("steps", [])
     failure_reason = trace_dict.get("failure_reason", "unknown")
+    is_content_filter_stop = "content_filter_triggered" in failure_reason
 
     # Collect confirmed tables (from show_context_schema observations)
     confirmed_tables: list[str] = []
     # Collect productive SQL (queries that returned rows)
     productive_sql: list[str] = []
+    # Track search_doc calls that returned 0 results — agent must not repeat these
+    exhausted_searches: list[str] = []
     # Collect the last N non-empty thoughts
     last_thoughts: list[str] = []
     # Detect consecutive API errors (e.g. content-filter rejections)
     failed_actions: list[str] = []  # actions that produced errors
     consecutive_errors = 0
+    # Track large tool results for content-filter diagnosis
+    # Each entry: (action, file_or_table, result_size_chars)
+    large_results: list[tuple[str, str, int]] = []
 
     for step in steps:
         action = step.get("action", "")
@@ -514,6 +689,24 @@ def summarise_trace_for_resumption(trace_dict: dict) -> str:
                 row_count = len(rows)
                 productive_sql.append(f"  [{row_count} rows] {sql[:120].strip()}")
 
+        if action == "search_doc" and obs.get("ok"):
+            total = content.get("total_matches", -1) if isinstance(content, dict) else -1
+            if total == 0:
+                keyword = step.get("action_input", {}).get("keyword", "")
+                file_path = step.get("action_input", {}).get("path", "")
+                exhausted_searches.append(f"  keyword='{keyword}' in {file_path}")
+
+        # Track large tool result observations (potential content-filter triggers)
+        if obs.get("ok") and action not in ("show_context_schema",):
+            result_size = len(str(content))
+            if result_size > 3000:
+                file_ref = (
+                    step.get("action_input", {}).get("path")
+                    or step.get("action_input", {}).get("sql", "")[:60]
+                    or action
+                )
+                large_results.append((action, str(file_ref), result_size))
+
         # Track repeated model-level errors (content filter, parse failures, etc.)
         if action == "__error__":
             error_msg = obs.get("error", "")
@@ -526,7 +719,12 @@ def summarise_trace_for_resumption(trace_dict: dict) -> str:
         if thought:
             last_thoughts.append(thought)
 
-    lines = ["[Prior attempt summary — agent exhausted max steps without submitting an answer]"]
+    stop_reason = (
+        "agent stopped early — content moderation triggered by sensitive data in context"
+        if is_content_filter_stop
+        else "agent exhausted max steps without submitting an answer"
+    )
+    lines = [f"[Prior attempt summary — {stop_reason}]"]
 
     if confirmed_tables:
         lines.append(f"Confirmed tables in schema: {', '.join(confirmed_tables[:12])}")
@@ -534,6 +732,14 @@ def summarise_trace_for_resumption(trace_dict: dict) -> str:
     if productive_sql:
         lines.append("SQL queries that returned data (reuse these as a starting point):")
         for s in productive_sql[-5:]:  # last 5 productive queries
+            lines.append(s)
+
+    if exhausted_searches:
+        lines.append(
+            "Searches ALREADY DONE with ZERO results — do NOT repeat any of these "
+            "(searching again will waste steps and produce the same empty result):"
+        )
+        for s in exhausted_searches[-10:]:
             lines.append(s)
 
     # Last 3 non-empty thoughts show what the agent was trying to do
@@ -551,6 +757,19 @@ def summarise_trace_for_resumption(trace_dict: dict) -> str:
             "The approach that triggered them must NOT be repeated. "
             "If execute_python produced large text output that caused content-filter errors, "
             "use read_doc with a focused query instead — it returns only relevant sections."
+        )
+
+    if is_content_filter_stop and large_results:
+        last_large = large_results[-1]
+        lines.append(
+            f"CONTENT FILTER WARNING: This attempt was halted because accumulated context "
+            f"triggered API content moderation (sensitive patient/medical data in context). "
+            f"The last large result before the stop was: action='{last_large[0]}' on "
+            f"'{last_large[1]}' ({last_large[2]} chars). "
+            f"In this attempt, DO NOT repeat that broad query on sensitive data. "
+            f"Use more targeted queries: search_doc with specific IDs rather than broad keywords, "
+            f"or use SQL to aggregate/filter before reading raw data. "
+            f"Avoid loading large raw patient records into context."
         )
 
     lines.append(f"Blocking issue: {failure_reason}")
@@ -609,8 +828,6 @@ class DataAgent:
                 is injected into the task prompt as additional context so the agent
                 can avoid repeating the same dead-ends.
         """
-        tools = create_data_agent_tool_registry()
-
         # Pre-flight: analyse the question against the schema and raw data.
         # The resulting hint is injected into the first user message so the
         # agent starts with candidate tables, columns, literal filters, and
@@ -654,8 +871,20 @@ class DataAgent:
             "task_analysis": dict(task_analysis),
         }
 
-        # Prepend prior attempt summaries to the task hint so the agent can
-        # skip already-explored paths and focus on what's left to try.
+        # Extract exhausted searches from prior summaries and hard-block them.
+        # This prevents the model from repeating search_doc calls that already
+        # returned 0 results — the tool itself will reject those queries.
+        blocked_searches = _parse_exhausted_searches(prior_attempts or [])
+        if blocked_searches:
+            log.info("BLOCKED SEARCHES from prior attempts: %d", len(blocked_searches))
+
+        tools = create_data_agent_tool_registry(
+            model=self.model, task=task, blocked_searches=blocked_searches
+        )
+
+        # Inject prior attempt summaries BEFORE the task question so the model
+        # reads them with high attention before anchoring to its default strategy.
+        # (Appending after the question causes the model to ignore them.)
         if prior_attempts:
             prior_block = _format_prior_attempts(prior_attempts)
             task_hint = (prior_block + "\n\n" + task_hint) if task_hint else prior_block

@@ -278,7 +278,22 @@ class ReActAgent:
         messages = [ModelMessage(role="system", content=system_content)]
         task_content = build_task_prompt(task)
         if self.task_hint:
-            task_content = task_content + "\n\n" + self.task_hint
+            hint = self.task_hint
+            # If the hint starts with a [Prior attempt summary] block, place it
+            # BEFORE the task question so the model reads it with high attention
+            # before anchoring to its default strategy.  Remaining hint (schema
+            # analysis) stays appended after the question as usual.
+            if "[Prior attempt summary" in hint:
+                prior_end = hint.find("\n\n[Pre-flight")
+                if prior_end == -1:
+                    # No schema analysis follows — entire hint is prior-attempt context
+                    task_content = hint + "\n\n" + task_content
+                else:
+                    prior_part = hint[:prior_end]
+                    rest = hint[prior_end + 2:]
+                    task_content = prior_part + "\n\n" + task_content + "\n\n" + rest
+            else:
+                task_content = task_content + "\n\n" + hint
         messages.append(ModelMessage(role="user", content=task_content))
 
         # Count consecutive __error__ steps at the tail of the trace so we can escalate.
@@ -383,6 +398,24 @@ class ReActAgent:
                     log.info("DONE answer accepted at step %d", step_index)
                     break
             except Exception as exc:
+                exc_str = str(exc)
+
+                # Content filter: the accumulated context contains data that triggered
+                # the API's moderation layer.  Adding more error turns cannot fix this
+                # because the offending content stays in the context window.  Stop
+                # immediately so the runner can start a fresh attempt with clean context.
+                if "data_inspection_failed" in exc_str:
+                    log.error(
+                        "CONTENT FILTER at step %d — stopping attempt early; "
+                        "runner will resume with fresh context (%d steps consumed)",
+                        step_index, len(state.steps),
+                    )
+                    state.failure_reason = (
+                        f"content_filter_triggered at step {step_index}: context accumulated "
+                        "data that caused API content moderation. Fresh attempt needed."
+                    )
+                    break
+
                 # Layer 1: attempt silent JSON repair before recording the error.
                 repaired = _try_repair_json(raw_response)
                 if repaired is not None:
@@ -420,10 +453,10 @@ class ReActAgent:
 
                 # Layer 2: record the error; _build_messages will inject the recovery hint
                 # as the next user message so the model knows exactly what went wrong.
-                log.error("  PARSE ERROR step=%d: %s", step_index, exc)
+                log.error("  PARSE ERROR step=%d: %s", step_index, exc_str)
                 observation = {
                     "ok": False,
-                    "error": str(exc),
+                    "error": exc_str,
                 }
                 state.steps.append(
                     StepRecord(
