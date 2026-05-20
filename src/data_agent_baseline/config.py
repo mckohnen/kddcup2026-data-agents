@@ -45,6 +45,9 @@ class RunConfig:
     # Example: [250, 500, 750] → attempt 1 gets 250 s, attempt 2 gets 500 s, attempt 3 gets 750 s.
     # If empty, falls back to [task_timeout_seconds] * (1 + max_resumptions).
     task_timeout_seconds_per_attempt: tuple[int, ...] = field(default_factory=tuple)
+    # Keep agent.log even for tasks that produced a prediction.csv.
+    # Useful during development; set to false for production runs to save disk space.
+    keep_logs: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +104,7 @@ def load_app_config(config_path: Path) -> AppConfig:
         preflight_timeout_seconds=int(run_payload.get("preflight_timeout_seconds", run_defaults.preflight_timeout_seconds)),
         max_resumptions=int(run_payload.get("max_resumptions", run_defaults.max_resumptions)),
         task_timeout_seconds_per_attempt=per_attempt,
+        keep_logs=bool(run_payload.get("keep_logs", run_defaults.keep_logs)),
     )
     env: dict[str, str] = {}
     for key, value in payload.get("env", {}).items():
