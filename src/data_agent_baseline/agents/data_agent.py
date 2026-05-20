@@ -318,11 +318,23 @@ def _search_doc(task: PublicTask, action_input: dict) -> ToolExecutionResult:
 
     paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
     matches = [p for p in paragraphs if keyword in p.lower()]
+
+    # Semantic fallback: when exact match finds nothing, use BM25+embedding ensemble
+    retrieval_used = "exact"
+    if not matches and len(text) > 500:
+        from data_agent_baseline.tools.md_retrieval import retrieve_relevant_chunks
+        fallback_text = retrieve_relevant_chunks(
+            text, keyword, top_k=max_results, max_chars=max_results * 1000
+        )
+        matches = [p.strip() for p in re.split(r"\n{2,}", fallback_text) if p.strip()]
+        retrieval_used = "semantic"
+
     return ToolExecutionResult(ok=True, content={
         "keyword": keyword,
         "total_matches": len(matches),
         "showing": min(max_results, len(matches)),
         "results": matches[:max_results],
+        "retrieval": retrieval_used,
     })
 
 

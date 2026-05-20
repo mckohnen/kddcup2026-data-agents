@@ -12,75 +12,99 @@ from rank_bm25 import BM25Okapi
 from data_agent_baseline.task_logger import get_logger
 
 # ---------------------------------------------------------------------------
-# Embedding model — lazy singleton, falls back to BM25-only if unavailable
+# Embedding models — lazy singletons, ensemble of BGE + MiniLM
+# Falls back to BM25-only if neither model loads.
 # ---------------------------------------------------------------------------
 
-_embed_model: Any = None
-_embed_model_loaded: bool = False
-_embed_model_lock = threading.Lock()
+_MODEL_NAMES = [
+    "BAAI/bge-small-en-v1.5",
+    "sentence-transformers/all-MiniLM-L6-v2",
+]
+
+_embed_models: list[Any] = []
+_embed_models_loaded: bool = False
+_embed_models_lock = threading.Lock()
 
 
-def _get_embed_model() -> Any:
-    global _embed_model, _embed_model_loaded
-    with _embed_model_lock:
-        if _embed_model_loaded:
-            return _embed_model
-        _embed_model_loaded = True
+def _get_embed_models() -> list[Any]:
+    global _embed_models, _embed_models_loaded
+    with _embed_models_lock:
+        if _embed_models_loaded:
+            return _embed_models
+        _embed_models_loaded = True
 
         log = get_logger()
-        result: dict = {}
+        cache_dir = os.environ.get("FASTEMBED_CACHE_PATH")
+        loaded: list[Any] = []
 
         def _load() -> None:
             try:
                 from fastembed import TextEmbedding
-                cache_dir = os.environ.get("FASTEMBED_CACHE_PATH")
-                log.info("  EMBED loading model (cache=%s)", cache_dir or "~/.cache/fastembed")
-                result["model"] = TextEmbedding("BAAI/bge-small-en-v1.5", cache_dir=cache_dir)
+                for name in _MODEL_NAMES:
+                    try:
+                        log.info("  EMBED loading %s (cache=%s)", name, cache_dir or "~/.cache/fastembed")
+                        loaded.append(TextEmbedding(name, cache_dir=cache_dir))
+                        log.info("  EMBED %s ready", name)
+                    except Exception as exc:
+                        log.warning("  EMBED %s failed (%s) — skipping", name, exc)
             except Exception as exc:
-                log.warning("  EMBED model load failed (%s) — BM25-only fallback", exc)
-                result["model"] = None
+                log.warning("  EMBED fastembed unavailable (%s) — BM25-only fallback", exc)
 
         t = threading.Thread(target=_load, daemon=True)
         t0 = time.perf_counter()
         t.start()
-        t.join(timeout=15)
+        t.join(timeout=30)
         elapsed = time.perf_counter() - t0
 
         if t.is_alive():
             log.warning("  EMBED model load timed out after %.1fs — BM25-only fallback", elapsed)
-            _embed_model = None
         else:
-            _embed_model = result.get("model")
-            if _embed_model is not None:
-                log.info("  EMBED model ready in %.1fs", elapsed)
+            _embed_models = loaded
+            log.info("  EMBED %d model(s) ready in %.1fs", len(_embed_models), elapsed)
 
-        return _embed_model
+        return _embed_models
 
 
 def _rerank(candidate_chunks: list[str], query: str, top_k: int) -> list[int]:
-    """Return indices of top_k candidates ranked by embedding cosine similarity.
+    """Return indices of top_k candidates ranked by ensemble cosine similarity.
 
-    Falls back to returning the first top_k indices (BM25 order) if the
-    embedding model is unavailable.  BGE vectors are unit-normalised so the
-    dot product equals cosine similarity.
+    Averages normalised cosine scores from BGE and MiniLM. Both models produce
+    unit-normalised vectors so dot product == cosine similarity. Falls back to
+    BM25 order if no models are available.
     """
     log = get_logger()
-    model = _get_embed_model()
-    if model is None:
-        log.debug("  EMBED skipped (model unavailable) — using BM25 order for top_%d", top_k)
+    models = _get_embed_models()
+    if not models:
+        log.debug("  EMBED skipped (no models) — using BM25 order for top_%d", top_k)
         return list(range(min(top_k, len(candidate_chunks))))
-    try:
-        t0 = time.perf_counter()
-        vectors = np.array(list(model.embed([query] + candidate_chunks)))
-        q_vec = vectors[0]
-        c_vecs = vectors[1:]
-        scores = c_vecs @ q_vec
-        elapsed = time.perf_counter() - t0
-        log.info("  EMBED reranked %d candidates → top_%d in %.2fs", len(candidate_chunks), top_k, elapsed)
-        return sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
-    except Exception as exc:
-        log.warning("  EMBED inference failed (%s) — BM25 order fallback", exc)
+
+    texts = [query] + candidate_chunks
+    ensemble_scores: np.ndarray | None = None
+    t0 = time.perf_counter()
+    for model in models:
+        try:
+            vectors = np.array(list(model.embed(texts)))
+            q_vec = vectors[0]
+            c_vecs = vectors[1:]
+            scores = c_vecs @ q_vec
+            # min-max normalise so both models contribute equally
+            s_min, s_max = scores.min(), scores.max()
+            if s_max > s_min:
+                scores = (scores - s_min) / (s_max - s_min)
+            ensemble_scores = scores if ensemble_scores is None else ensemble_scores + scores
+        except Exception as exc:
+            log.warning("  EMBED inference failed for model (%s) — skipping", exc)
+
+    if ensemble_scores is None:
+        log.warning("  EMBED all models failed — BM25 order fallback")
         return list(range(min(top_k, len(candidate_chunks))))
+
+    elapsed = time.perf_counter() - t0
+    log.info(
+        "  EMBED ensemble(%d models) reranked %d candidates → top_%d in %.2fs",
+        len(models), len(candidate_chunks), top_k, elapsed,
+    )
+    return sorted(range(len(ensemble_scores)), key=lambda i: ensemble_scores[i], reverse=True)[:top_k]
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +174,7 @@ def retrieve_relevant_chunks(
     t0 = time.perf_counter()
     bm25 = BM25Okapi(tokenized)
     bm25_scores = bm25.get_scores(_tokenize(query))
-    n_candidates = min(top_k * 2, len(chunks))
+    n_candidates = min(top_k * 4, len(chunks))
     candidate_indices = sorted(
         range(len(bm25_scores)),
         key=lambda i: bm25_scores[i],
