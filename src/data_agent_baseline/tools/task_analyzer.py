@@ -529,6 +529,22 @@ def build_task_analysis(
         except OSError:
             pass
 
+    # Run coverage gap extraction — must come after _match_literal_values_sql above
+    # which has already cached the SQLite connection.  The extractor injects
+    # *_complete tables directly into that cached connection so the Analyst sees
+    # them on its first SQL call without any extra steps.
+    extracted_tables: list[dict] = []
+    if model is not None:
+        try:
+            from data_agent_baseline.tools.coverage_extractor import detect_and_extract_coverage_gaps
+            extracted_tables = detect_and_extract_coverage_gaps(
+                context_dir=context_dir,
+                model=model,
+                timeout_seconds=25,
+            )
+        except Exception:
+            pass
+
     return {
         "question": question,
         "matched_terms": all_matches,
@@ -540,6 +556,7 @@ def build_task_analysis(
         "coverage_warnings": coverage_warnings,
         "doc_contents": doc_contents,
         "knowledge_content": knowledge_content,
+        "extracted_tables": extracted_tables,
         "_schema_tables": list(context.get("tables", {}).keys()),
     }
 
@@ -610,7 +627,22 @@ def format_task_analysis_hint(analysis: dict) -> str:
     if m["metric"] != "unknown":
         lines.append(f"Metric hint:        {m['metric'].upper()} ({m['aggregation']}) — verify in docs")
 
+    # Extracted tables: show prominently; suppress raw coverage warning for handled gaps.
+    extracted = analysis.get("extracted_tables", [])
+    extracted_lookup_names = {e["lookup_table"] for e in extracted}
+    for e in extracted:
+        attrs = ", ".join(e["attr_cols"])
+        id_col = e.get("lookup_id_col", "ID")
+        lines.append(
+            f"EXTRACTED TABLE READY: '{e['complete_table']}' ({e['ids_extracted']} new rows "
+            f"from {e['source_doc']} merged in, columns: {id_col}, {attrs}) — "
+            f"USE THIS instead of '{e['lookup_table']}' for complete {attrs} coverage. "
+            f"Do NOT re-extract from prose — the data is already in the SQL context."
+        )
+
     for w in analysis.get("coverage_warnings", []):
+        if w["lookup_table"] in extracted_lookup_names:
+            continue  # gap was handled by extractor — no need to warn
         lines.append(
             f"DATA COVERAGE WARNING: '{w['lookup_table']}' covers only some IDs in "
             f"'{w['fact_table']}' — {w['missing_ids']} distinct {w['lookup_id_col']} values "

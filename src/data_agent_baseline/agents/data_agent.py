@@ -66,16 +66,12 @@ Step 3 — Inspect schema and consider ALL data sources:
   Call show_context_schema to see all tables, columns, row counts, type hints, and inferred
   relationships. ALL data sources are unified in one SQLite connection:
 
-  Data completeness check (do this before writing filter queries):
-  If the question requires filtering by an attribute (sex, status, type, category) and there
-  is a small lookup table providing that attribute, verify that the lookup table covers all
-  IDs in the fact table before filtering. Run:
-    SELECT COUNT(*) FROM fact_table WHERE id_col NOT IN (SELECT id_col FROM lookup_table)
-  If the coverage gap is > 0, the lookup table is INCOMPLETE. Check prose documents for
-  the missing attribute data. Use lookup_ids_in_doc to find which IDs appear in prose and
-  extract their attributes (e.g. gender, DOB) from the returned paragraphs.
-  Build a complete attribute set by combining the CSV lookup table with the prose data
-  before running the final filter query.
+  Pre-extracted lookup tables: the preflight phase has already detected coverage
+  gaps and extracted missing attributes from prose documents into *_complete tables.
+  Check the preflight hint for "EXTRACTED TABLE READY" entries — if one exists for a
+  lookup table you need (e.g. patient_sex_complete instead of patient_sex), USE IT.
+  These tables are already in the SQL context with full ID coverage.
+  Do NOT attempt to re-extract from prose or call lookup_ids_in_doc — the data is ready.
   - CSV and JSON files → accessible as plain table names (e.g. SELECT * FROM atom)
   - SQLite .db files   → accessible as <db_stem>.<table> (e.g. SELECT * FROM hero_power.hero_power)
   - Large prose doc/*.md files → indexed as <filename_stem>_paragraphs(paragraph_idx INTEGER, content TEXT)
@@ -201,40 +197,8 @@ Step 4 — Query and analyse:
     If you know the upper limit but not the lower limit of a normal range, use just the upper
     limit (e.g. creatinine > 1.2 mg/dL = abnormal) — partial criteria beat no answer.
 
-  Prose extraction strategy (when structured tables exist alongside prose docs):
-  When you need to look up attributes in a prose doc for IDs from a structured table
-  (e.g. gender from Patient.md for IDs from Laboratory), use lookup_ids_in_doc FIRST.
-  ALWAYS include the 'attribute' parameter so the LLM extracts the value for you:
-    lookup_ids_in_doc(table_name="Laboratory", id_column="ID",
-                      doc_path="doc/Patient.md", attribute="gender (M for male, F for female)")
-  This scans the whole document, finds every ID regardless of reference style
-  ("Patient 43003", "Case ID 43003", "John Smith", etc.), then makes one LLM call to
-  extract the requested attribute for each matched entity. Returns {id: extracted_value}.
-  Use the extracted values directly — no further parsing needed.
-  Only fall back to execute_python if lookup_ids_in_doc returns 0 matched IDs.
-
-  CRITICAL — combining CSV lookup table with prose results:
-  lookup_ids_in_doc returns only IDs that appeared in the prose document. When a CSV
-  lookup table already covers some IDs (e.g. patient_sex.csv covers 92 of 302 patients),
-  you MUST include BOTH sources in the final filter. Use OR in SQL:
-    SELECT COUNT(DISTINCT l.ID) FROM Laboratory l
-    WHERE (
-        l.ID IN (SELECT ID FROM patient_sex WHERE SEX = 'M')   -- CSV coverage
-        OR l.ID IN ('<prose_male_1>', '<prose_male_2>', ...)    -- prose coverage
-    )
-    AND <other filters>
-  Never query only the prose IDs — you will miss the patients already covered by the CSV.
-
-  Narrow-then-extract (alternative when lookup_ids_in_doc output is too large):
-    1. First run SQL to get a small candidate ID set: SELECT DISTINCT id FROM fact WHERE <filters>
-    2. Then use execute_python to read the prose file and extract the attribute ONLY for
-       those IDs — not for every entity in the file.
-  This is faster when the candidate set is small (< 50 IDs).
-  Exception: if all data is in prose (ALL-DOCS MODE), full extraction is necessary.
-
-  For exhaustive entity extraction from prose documents (e.g. listing every patient whose
-  label is X, collecting all values of a field across a large Markdown file), use
-  execute_python ONLY after read_doc has failed to surface what you need:
+  For exhaustive entity extraction from prose documents (ALL-DOCS MODE or when the
+  preflight extracted table is missing), use execute_python:
     - Open the file by path under the context directory.
     - Process it paragraph by paragraph (not sentence by sentence) to handle cases where
       an entity ID and its classification appear in different sentences of the same paragraph.
@@ -722,28 +686,6 @@ _TOOL_SPECS: dict[str, ToolSpec] = {
         ),
         input_schema={"code": "import os\nprint(sorted(os.listdir('.')))"},
     ),
-    "lookup_ids_in_doc": ToolSpec(
-        name="lookup_ids_in_doc",
-        description=(
-            "Find entities in a prose document that correspond to IDs from a structured table, "
-            "and optionally extract a specific attribute for each matched entity via LLM. "
-            "Queries table_name.id_column for all distinct values, scans doc_path "
-            "paragraph-by-paragraph for exact word-boundary matches, then — if 'attribute' is "
-            "provided — makes a single batched LLM call to extract that attribute from each "
-            "matched paragraph set. Works for any identifier type (numeric IDs, names, codes) "
-            "and any reference style ('Patient 43003', 'Case ID 43003', 'John Smith', etc.). "
-            "ALWAYS pass 'attribute' to get extracted values directly (e.g. 'gender (M/F)', "
-            "'year of birth', 'city of residence'). Without 'attribute', raw paragraphs are "
-            "returned and you still need to parse them yourself. "
-            "Use this BEFORE writing manual execute_python regex for any ID-to-attribute lookup."
-        ),
-        input_schema={
-            "table_name": "Laboratory",
-            "id_column": "ID",
-            "doc_path": "doc/Patient.md",
-            "attribute": "gender (M for male, F for female)",
-        },
-    ),
     "answer": ToolSpec(
         name="answer",
         description=(
@@ -760,8 +702,7 @@ _TOOL_HANDLERS = {
     "list_context": _list_context,
     "read_doc": _read_doc,
     "read_knowledge_section": _read_knowledge_section,
-    # search_doc and lookup_ids_in_doc are NOT included here — both are created
-    # per-task via factories that capture model/task/blocked-search state.
+    # search_doc is NOT included here — created per-task via factory.
     # See create_data_agent_tool_registry.
     "show_context_schema": _show_context_schema,
     "query_context_tables": _query_context_tables,
@@ -812,11 +753,6 @@ def create_data_agent_tool_registry(
         handlers["search_doc"] = lambda _task, ai: ToolExecutionResult(
             ok=False, content={"error": "search_doc requires task context."}
         )
-
-    # lookup_ids_in_doc is wired here so it captures the model for LLM-based
-    # attribute extraction.  Without a model it still works (returns raw paragraphs).
-    _lookup_impl = _make_lookup_ids_in_doc(model)
-    handlers["lookup_ids_in_doc"] = _lookup_impl
 
     if model is not None:
         def _consult_domain_knowledge(_task: PublicTask, action_input: dict) -> ToolExecutionResult:
