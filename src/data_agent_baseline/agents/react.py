@@ -43,8 +43,24 @@ class ReActAgentConfig:
     max_steps: int = 16
 
 
+def _strip_think_tags(text: str) -> str:
+    """Remove Qwen3-style <think>...</think> reasoning blocks before parsing.
+
+    Qwen3 reasoning models emit a thinking preamble before their actual JSON
+    response.  The block may be closed (<think>...</think>) or unclosed
+    (<think>... with no closing tag).  Strip both forms so the parser sees
+    only the JSON output.
+    """
+    # Closed form: <think>...</think> (greedy — the block may span many lines)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    # Unclosed form: <think> with no matching </think> — drop everything from
+    # the opening tag to the end of the string.
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
+    return text.strip()
+
+
 def _strip_json_fence(raw_response: str) -> str:
-    text = raw_response.strip()
+    text = _strip_think_tags(raw_response).strip()
     fence_match = re.search(r"```json\s*(.*?)\s*```", text, flags=re.IGNORECASE | re.DOTALL)
     if fence_match is not None:
         return fence_match.group(1).strip()

@@ -28,7 +28,10 @@ from __future__ import annotations
 import json
 import re
 from difflib import SequenceMatcher
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from data_agent_baseline.agents.model import ModelAdapter, ModelMessage
 
 
 # ---------------------------------------------------------------------------
@@ -359,10 +362,111 @@ def _check_id_coverage(context: dict, context_dir: "Path") -> list[dict]:
     return warnings
 
 
+_DOC_SCAN_CHARS = 2000  # chars read from each doc file — first paragraph reveals structure
+
+_DOC_SCAN_SYSTEM_PROMPT = (
+    "You are a data analyst. You will be shown opening excerpts from one or more data documents. "
+    "For each document, output exactly one line in the format:\n"
+    "  <filename>: <one-sentence description of entity types and attributes>\n"
+    "Be specific about attribute names where visible (e.g. patient IDs, gender, "
+    "measurement values with units, categorical labels, dates). "
+    "No preamble, no explanation — only the lines."
+)
+
+
+def count_doc_files(context_dir: "Path") -> int:
+    """Count the number of .md files in context_dir/doc/ excluding knowledge.md.
+
+    Returns 0 if the doc/ directory does not exist.
+    This count is used to compute a dynamic preflight budget in data_agent.py.
+    """
+    doc_dir = context_dir / "doc"
+    if not doc_dir.is_dir():
+        return 0
+    count = 0
+    for md_file in doc_dir.glob("*.md"):
+        if md_file.name.lower() != "knowledge.md":
+            count += 1
+    return count
+
+
+def _scan_doc_contents(context_dir: "Path", model: "ModelAdapter | None" = None) -> list[dict]:
+    """Use batched LLM calls to describe all doc/*.md files in the context.
+
+    Reads the first _DOC_SCAN_CHARS characters of each doc file, batches them
+    in groups of 2, and makes one LLM call per batch. Results from all batches
+    are combined into a single list.
+    knowledge.md files are excluded (domain reference material, not data).
+
+    Returns a list of dicts:
+      {"file": "doc/Patient.md", "description": "Contains patient IDs, gender ..."}
+
+    If no model is provided, or no doc files exist, returns an empty list.
+    """
+    if model is None:
+        return []
+
+    from data_agent_baseline.agents.model import ModelMessage  # noqa: PLC0415
+
+    doc_dir = context_dir / "doc"
+    if not doc_dir.is_dir():
+        return []
+
+    # Collect (filename, excerpt) pairs — exclude knowledge.md
+    excerpts: list[tuple[str, str]] = []
+    for md_file in sorted(doc_dir.glob("*.md")):
+        if md_file.name.lower() == "knowledge.md":
+            continue
+        try:
+            text = md_file.read_text(encoding="utf-8", errors="replace")[:_DOC_SCAN_CHARS]
+        except OSError:
+            continue
+        if text.strip():
+            excerpts.append((md_file.name, text.strip()))
+
+    if not excerpts:
+        return []
+
+    known_names = {name for name, _ in excerpts}
+
+    def _parse_response(response: str) -> list[dict]:
+        results: list[dict] = []
+        for line in response.splitlines():
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            fname, _, desc = line.partition(":")
+            fname = fname.strip()
+            # Accept if filename matches (with or without path prefix)
+            if fname in known_names or any(fname == n or fname.endswith(n) for n in known_names):
+                results.append({"file": f"doc/{fname}", "description": desc.strip()})
+        return results
+
+    # Process docs in batches of 2, one LLM call per batch
+    _BATCH_SIZE = 2
+    all_results: list[dict] = []
+    for batch_start in range(0, len(excerpts), _BATCH_SIZE):
+        batch = excerpts[batch_start : batch_start + _BATCH_SIZE]
+        sections = "\n\n".join(
+            f"--- {name} ---\n{text}" for name, text in batch
+        )
+        try:
+            response = model.complete([
+                ModelMessage(role="system", content=_DOC_SCAN_SYSTEM_PROMPT),
+                ModelMessage(role="user", content=sections),
+            ]).strip()
+        except Exception:  # noqa: BLE001
+            continue  # skip failed batch, try remaining ones
+        all_results.extend(_parse_response(response))
+
+    return all_results
+
+
 def build_task_analysis(
     question: str,
     context: dict,
     context_dir: "Path",
+    model: "ModelAdapter | None" = None,
 ) -> dict[str, Any]:
     """Analyse a question against the context schema and data.
 
@@ -373,11 +477,14 @@ def build_task_analysis(
         context_dir:  Path to the task context directory.  Used to get the
                       unified SQLite connection for literal value matching
                       across all sources (.db, CSV, JSON).
+        model:        Optional model adapter.  When provided, each doc/*.md file
+                      (excluding knowledge.md) is summarised by a single LLM call
+                      so the agent knows what attributes are available in prose.
 
     Returns:
         Dict with keys: ``matched_terms``, ``candidate_tables``,
         ``candidate_columns``, ``required_joins``, ``filter_candidates``,
-        ``metric``, ``coverage_warnings``.
+        ``metric``, ``coverage_warnings``, ``doc_contents``.
     """
     table_matches = _match_tables(question, context)
     column_matches = _match_columns(question, context)
@@ -410,6 +517,17 @@ def build_task_analysis(
     ]
 
     coverage_warnings = _check_id_coverage(context, context_dir)
+    doc_contents = _scan_doc_contents(context_dir, model=model)
+
+    knowledge_content: str = ""
+    knowledge_path = context_dir / "knowledge.md"
+    if not knowledge_path.exists():
+        knowledge_path = context_dir / "doc" / "knowledge.md"
+    if knowledge_path.exists():
+        try:
+            knowledge_content = knowledge_path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            pass
 
     return {
         "question": question,
@@ -420,6 +538,8 @@ def build_task_analysis(
         "filter_candidates": filter_candidates,
         "metric": _infer_metric(question),
         "coverage_warnings": coverage_warnings,
+        "doc_contents": doc_contents,
+        "knowledge_content": knowledge_content,
         "_schema_tables": list(context.get("tables", {}).keys()),
     }
 
@@ -432,12 +552,21 @@ def format_task_analysis_hint(analysis: dict) -> str:
     JOINs are split into confirmed (≥ 0.95) and possible (0.80–0.95) tiers.
     A prominent disclaimer reminds the agent that this is a starting point only.
     """
+    schema_tables = analysis.get("_schema_tables", [])
+    has_schema_info = bool(schema_tables)
+
     lines = [
         "[Pre-flight schema analysis]",
         "NOTE: This is a best-effort analysis of the question. It may be incomplete or",
-        "contain incorrect links. Always call show_context_schema for the full authoritative",
-        "schema, and verify any suggested joins against the actual data before using them.",
+        "contain incorrect links. Verify any suggested joins against the actual data before using them.",
     ]
+    if has_schema_info:
+        lines.append(
+            f"Schema already profiled ({len(schema_tables)} table(s): "
+            + ", ".join(schema_tables[:6])
+            + (f" … +{len(schema_tables) - 6} more" if len(schema_tables) > 6 else "")
+            + "). Do NOT call show_context_schema at step 1 — go directly to data work."
+        )
 
     if analysis["candidate_tables"]:
         lines.append(f"Candidate tables:   {', '.join(analysis['candidate_tables'])}")
@@ -490,14 +619,23 @@ def format_task_analysis_hint(analysis: dict) -> str:
             f"and parse it to build a complete lookup before filtering."
         )
 
+    knowledge_content = analysis.get("knowledge_content", "")
+    if knowledge_content:
+        lines.append(f"KNOWLEDGE.MD (full content — do not read this file again):\n{knowledge_content}")
+
+    for doc in analysis.get("doc_contents", []):
+        lines.append(
+            f"DOC CONTENT ({doc['file']}): {doc['description']} "
+            f"Use execute_python with regex to extract structured data from this file when needed."
+        )
+
     # Detect all-docs mode: only *_paragraphs tables are present
-    all_tables = analysis.get("candidate_tables", [])
     context_schema = analysis.get("_schema_tables", [])
     if context_schema and all(t.endswith("_paragraphs") for t in context_schema):
         lines.append(
             "ALL-DOCS MODE: show_context_schema has ONLY *_paragraphs tables — "
             "ALL structured data is embedded in prose documents. "
-            "Use execute_python with regex to extract patient/entity IDs and values from "
+            "Use execute_python with regex to extract entity IDs and values from "
             "the full doc files. Do NOT rely on search_doc for data extraction. "
             "See ALL-DOCS MODE instructions in the system prompt."
         )

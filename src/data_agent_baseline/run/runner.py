@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import multiprocessing
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -87,6 +88,56 @@ def _write_csv(path: Path, columns: list[str], rows: list[list[Any]]) -> None:
         writer.writerow(columns)
         for row in rows:
             writer.writerow(row)
+
+
+class TaskStatusLog:
+    """Thread-safe, progressively-written task status file.
+
+    Written to ``<run_output_dir>/task_status.json`` and updated after every
+    task completes so partial runs can be inspected live.
+
+    Statuses: pending → running → success | failed
+    """
+
+    def __init__(self, path: Path, task_ids: list[str]) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+        self._statuses: dict[str, dict] = {
+            tid: {"status": "pending"} for tid in task_ids
+        }
+        self._write()
+
+    def mark_running(self, task_id: str) -> None:
+        with self._lock:
+            self._statuses[task_id].update(
+                status="running",
+                started_at=datetime.now(timezone.utc).isoformat(),
+            )
+            self._write()
+
+    def mark_done(self, task_id: str, artifact: TaskRunArtifacts) -> None:
+        with self._lock:
+            entry = self._statuses[task_id]
+            entry["status"] = "success" if artifact.succeeded else "failed"
+            entry["finished_at"] = datetime.now(timezone.utc).isoformat()
+            if artifact.failure_reason:
+                entry["failure_reason"] = artifact.failure_reason
+            entry["has_prediction"] = artifact.prediction_csv_path is not None
+            self._write()
+
+    def mark_retrying(self, task_id: str) -> None:
+        with self._lock:
+            self._statuses[task_id].update(
+                status="retrying",
+                retry_started_at=datetime.now(timezone.utc).isoformat(),
+            )
+            self._write()
+
+    def _write(self) -> None:
+        self._path.write_text(
+            json.dumps(self._statuses, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
 
 def _failure_run_result_payload(task_id: str, failure_reason: str) -> dict[str, Any]:
@@ -305,7 +356,18 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
     advances to the next official slot.  Timeouts and crashes are not resumable.
     """
     attempt_timeouts = _resolve_attempt_timeouts(config.run)
-    preflight_budget = config.run.preflight_timeout_seconds
+    # Dynamic preflight budget: base + 30s per batch of 2 doc files.
+    # Matches the logic in DataAgent.run() so the subprocess isn't killed while
+    # preflight is still running its LLM calls.
+    _base_preflight = config.run.preflight_timeout_seconds
+    try:
+        from data_agent_baseline.tools.task_analyzer import count_doc_files  # noqa: PLC0415
+        _context_dir = Path(config.dataset.root_path) / task_id / "context"
+        _n_docs = count_doc_files(_context_dir)
+        _n_batches = max(1, (_n_docs + 1) // 2)
+        preflight_budget = _base_preflight + (_n_batches - 1) * 30
+    except Exception:
+        preflight_budget = _base_preflight
     _MAX_FILTER_RECOVERIES = 5  # safety cap: avoid infinite content-filter loops
 
     prior_summaries: list[str] = []
@@ -495,12 +557,11 @@ def run_benchmark(
 
     task_ids = [task.task_id for task in tasks]
 
-    task_artifacts: list[TaskRunArtifacts]
-    if effective_workers == 1:
-        shared_model = model or build_model_adapter(config)
-        shared_tools = tools or create_default_tool_registry()
-        task_artifacts = []
-        for task_id in task_ids:
+    status_log = TaskStatusLog(run_output_dir / "task_status.json", task_ids)
+
+    def _run_and_update(task_id: str, *, shared_model=None, shared_tools=None) -> TaskRunArtifacts:
+        status_log.mark_running(task_id)
+        if shared_model is not None or shared_tools is not None:
             artifact = run_single_task(
                 task_id=task_id,
                 config=config,
@@ -508,18 +569,29 @@ def run_benchmark(
                 model=shared_model,
                 tools=shared_tools,
             )
+        else:
+            artifact = run_single_task(
+                task_id=task_id,
+                config=config,
+                run_output_dir=run_output_dir,
+            )
+        status_log.mark_done(task_id, artifact)
+        return artifact
+
+    task_artifacts: list[TaskRunArtifacts]
+    if effective_workers == 1:
+        shared_model = model or build_model_adapter(config)
+        shared_tools = tools or create_default_tool_registry()
+        task_artifacts = []
+        for task_id in task_ids:
+            artifact = _run_and_update(task_id, shared_model=shared_model, shared_tools=shared_tools)
             task_artifacts.append(artifact)
             if progress_callback is not None:
                 progress_callback(artifact)
     else:
         with ThreadPoolExecutor(max_workers=effective_workers) as executor:
             future_to_index = {
-                executor.submit(
-                    run_single_task,
-                    task_id=task_id,
-                    config=config,
-                    run_output_dir=run_output_dir,
-                ): index
+                executor.submit(_run_and_update, task_id): index
                 for index, task_id in enumerate(task_ids)
             }
             indexed_artifacts: list[TaskRunArtifacts | None] = [None] * len(task_ids)
@@ -529,6 +601,31 @@ def run_benchmark(
                 if progress_callback is not None:
                     progress_callback(artifact)
             task_artifacts = [artifact for artifact in indexed_artifacts if artifact is not None]
+
+    # Second-chance pass: re-run any tasks that produced no answer (timed out or
+    # deadlocked). Run sequentially with the full multi-slot timeout budget so each
+    # gets a genuine clean attempt.
+    failed_ids = [
+        a.task_id for a in task_artifacts
+        if not a.succeeded and a.prediction_csv_path is None
+    ]
+    if failed_ids:
+        retry_artifacts: dict[str, TaskRunArtifacts] = {}
+        for task_id in failed_ids:
+            status_log.mark_retrying(task_id)
+            artifact = run_single_task(
+                task_id=task_id,
+                config=config,
+                run_output_dir=run_output_dir,
+            )
+            status_log.mark_done(task_id, artifact)
+            retry_artifacts[task_id] = artifact
+            if progress_callback is not None:
+                progress_callback(artifact)
+        # Merge: replace failed artifacts with retry results
+        task_artifacts = [
+            retry_artifacts.get(a.task_id, a) for a in task_artifacts
+        ]
 
     summary_path = run_output_dir / "summary.json"
     _write_json(

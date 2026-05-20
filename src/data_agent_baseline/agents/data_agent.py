@@ -71,11 +71,11 @@ Step 3 — Inspect schema and consider ALL data sources:
   is a small lookup table providing that attribute, verify that the lookup table covers all
   IDs in the fact table before filtering. Run:
     SELECT COUNT(*) FROM fact_table WHERE id_col NOT IN (SELECT id_col FROM lookup_table)
-  If the coverage gap is > 0, the lookup table is INCOMPLETE. Check prose documents
-  (patient_paragraphs, entity_paragraphs, etc.) for the missing attribute data. Use
-  execute_python to parse the relevant doc file and extract the attribute for the missing
-  IDs. Build a complete attribute set by combining the CSV lookup table with the parsed
-  prose data before running the final filter query.
+  If the coverage gap is > 0, the lookup table is INCOMPLETE. Check prose documents for
+  the missing attribute data. Use lookup_ids_in_doc to find which IDs appear in prose and
+  extract their attributes (e.g. gender, DOB) from the returned paragraphs.
+  Build a complete attribute set by combining the CSV lookup table with the prose data
+  before running the final filter query.
   - CSV and JSON files → accessible as plain table names (e.g. SELECT * FROM atom)
   - SQLite .db files   → accessible as <db_stem>.<table> (e.g. SELECT * FROM hero_power.hero_power)
   - Large prose doc/*.md files → indexed as <filename_stem>_paragraphs(paragraph_idx INTEGER, content TEXT)
@@ -112,8 +112,27 @@ Step 4 — Query and analyse:
   For locating a specific term, threshold, or value in a large prose document:
     Call search_doc with the exact keyword before reaching for execute_python.
     search_doc returns all paragraphs containing the keyword — no code needed.
+    COMMIT-ON-FIRST-FIND: once an observation clearly states the threshold or range you
+    need (e.g. "creatinine upper limit of normal is 1.2 mg/dL"), STOP searching. Do NOT
+    call search_doc or read_doc again for the same fact. Proceed directly to execute_python
+    or query_context_tables using that value. Repeating the same search wastes steps.
 
   Important SQL rules:
+  - Multi-condition patient filtering (each condition may appear in DIFFERENT rows):
+    When a question asks for patients who satisfy condition A AND condition B (e.g. "has
+    normal WBC AND has abnormal FG"), NEVER combine both into a single WHERE clause —
+    that requires both to be non-null in the SAME ROW and will silently miss patients whose
+    measurements were taken on different dates. Always use separate subqueries:
+    WRONG:
+      WHERE CAST(WBC AS REAL) BETWEEN 3.5 AND 9.0
+        AND FG != '' AND CAST(FG AS REAL) < 150
+    RIGHT:
+      WHERE ID IN (SELECT ID FROM Laboratory WHERE WBC != ''
+                   AND CAST(WBC AS REAL) BETWEEN 3.5 AND 9.0)
+        AND ID IN (SELECT ID FROM Laboratory WHERE FG != ''
+                   AND CAST(FG AS REAL) < 150)
+    This rule applies to any multi-condition filter on longitudinal (time-series) data where
+    measurements may be recorded on separate visits.
   - CSV columns are stored as TEXT — ALWAYS use CAST for numeric comparisons and arithmetic.
     WRONG: WHERE height_cm > 200          (text comparison: '61' > '200' is TRUE!)
     RIGHT:  WHERE CAST(height_cm AS INTEGER) > 200
@@ -169,12 +188,49 @@ Step 4 — Query and analyse:
     general knowledge threshold may be in different units than the dataset (e.g. cells/µL
     vs ×10⁹/L). Scale the threshold to match what you observe in the data before filtering.
 
+    DISTRIBUTION-BASED ABNORMALITY RULE: After checking MIN/MAX/AVG, if you find that
+    ALL non-empty values in the column fall entirely outside the known reference range on
+    the same side (all below it, or all above it), do NOT keep searching for the "correct"
+    threshold or unit conversion. Instead, treat every non-empty value as abnormal and
+    filter with WHERE col IS NOT NULL AND col != ''. Do not waste further steps on this.
+
     COMMIT RULE: If after 10 steps total you still do not have an answer, stop searching
     and commit to your best estimate. An imperfect answer always scores better than no answer
     (no answer = 0 score). Use whatever evidence you have: domain knowledge thresholds,
     partial data ranges, or the most defensible assumption. Submit an answer even if uncertain.
     If you know the upper limit but not the lower limit of a normal range, use just the upper
     limit (e.g. creatinine > 1.2 mg/dL = abnormal) — partial criteria beat no answer.
+
+  Prose extraction strategy (when structured tables exist alongside prose docs):
+  When you need to look up attributes in a prose doc for IDs from a structured table
+  (e.g. gender from Patient.md for IDs from Laboratory), use lookup_ids_in_doc FIRST.
+  ALWAYS include the 'attribute' parameter so the LLM extracts the value for you:
+    lookup_ids_in_doc(table_name="Laboratory", id_column="ID",
+                      doc_path="doc/Patient.md", attribute="gender (M for male, F for female)")
+  This scans the whole document, finds every ID regardless of reference style
+  ("Patient 43003", "Case ID 43003", "John Smith", etc.), then makes one LLM call to
+  extract the requested attribute for each matched entity. Returns {id: extracted_value}.
+  Use the extracted values directly — no further parsing needed.
+  Only fall back to execute_python if lookup_ids_in_doc returns 0 matched IDs.
+
+  CRITICAL — combining CSV lookup table with prose results:
+  lookup_ids_in_doc returns only IDs that appeared in the prose document. When a CSV
+  lookup table already covers some IDs (e.g. patient_sex.csv covers 92 of 302 patients),
+  you MUST include BOTH sources in the final filter. Use OR in SQL:
+    SELECT COUNT(DISTINCT l.ID) FROM Laboratory l
+    WHERE (
+        l.ID IN (SELECT ID FROM patient_sex WHERE SEX = 'M')   -- CSV coverage
+        OR l.ID IN ('<prose_male_1>', '<prose_male_2>', ...)    -- prose coverage
+    )
+    AND <other filters>
+  Never query only the prose IDs — you will miss the patients already covered by the CSV.
+
+  Narrow-then-extract (alternative when lookup_ids_in_doc output is too large):
+    1. First run SQL to get a small candidate ID set: SELECT DISTINCT id FROM fact WHERE <filters>
+    2. Then use execute_python to read the prose file and extract the attribute ONLY for
+       those IDs — not for every entity in the file.
+  This is faster when the candidate set is small (< 50 IDs).
+  Exception: if all data is in prose (ALL-DOCS MODE), full extraction is necessary.
 
   For exhaustive entity extraction from prose documents (e.g. listing every patient whose
   label is X, collecting all values of a field across a large Markdown file), use
@@ -342,6 +398,153 @@ def _get_current_datetime(_: PublicTask, action_input: dict) -> ToolExecutionRes
         "month": now.month,
         "day": now.day,
     })
+
+
+_LOOKUP_EXTRACT_SYSTEM_PROMPT = (
+    "You are a data extraction assistant. You will be shown text passages about entities. "
+    "For each passage, extract the requested attribute for the entity mentioned. "
+    "Output exactly one line per entity in this format:\n"
+    "  <identifier>: <extracted value>\n"
+    "If the attribute is not mentioned in the passage, output:\n"
+    "  <identifier>: unknown\n"
+    "No preamble, no explanation — only the lines."
+)
+
+
+def _make_lookup_ids_in_doc(model: "ModelAdapter | None"):
+    """Factory returning a _lookup_ids_in_doc closure with access to the model."""
+
+    def _lookup_ids_in_doc(task: PublicTask, action_input: dict) -> ToolExecutionResult:
+        """Find and extract an attribute from prose for IDs from a structured table.
+
+        Scans `doc_path` paragraph-by-paragraph for exact word-boundary matches of
+        each distinct value in `table_name.id_column`.  Works for any identifier type
+        (numeric IDs, names, codes) and any reference style ("Patient 43003",
+        "Case ID 43003", "John Smith", etc.).
+
+        When `attribute` is provided (e.g. "gender (M/F)", "year of birth", "city"),
+        a single batched LLM call extracts that attribute from each matched paragraph
+        set and returns `{id: extracted_value}`.  Without `attribute`, returns
+        `{id: [paragraph_texts]}` for downstream processing.
+        """
+        from data_agent_baseline.tools.context_sqlite import run_sql_on_context
+
+        table_name = str(action_input.get("table_name", "")).strip()
+        id_column = str(action_input.get("id_column", "")).strip()
+        doc_path = str(action_input.get("doc_path", "")).strip()
+        attribute = str(action_input.get("attribute", "")).strip()
+
+        if not table_name or not id_column or not doc_path:
+            return ToolExecutionResult(ok=False, content={
+                "error": "table_name, id_column, and doc_path are all required."
+            })
+
+        # Get distinct IDs from SQL table
+        try:
+            sql_result = run_sql_on_context(
+                task.context_dir,
+                f'SELECT DISTINCT "{id_column}" FROM "{table_name}" WHERE "{id_column}" IS NOT NULL',
+                limit=10000,
+            )
+        except Exception as exc:
+            return ToolExecutionResult(ok=False, content={"error": f"SQL error: {exc}"})
+
+        ids = [str(row[0]).strip() for row in (sql_result.get("rows") or []) if row[0] is not None]
+        if not ids:
+            return ToolExecutionResult(ok=False, content={
+                "error": f"No non-null IDs found in {table_name}.{id_column}"
+            })
+
+        # Read and split prose document
+        full_doc_path = task.context_dir / doc_path
+        if not full_doc_path.exists():
+            return ToolExecutionResult(ok=False, content={"error": f"File not found: {doc_path}"})
+        if full_doc_path.is_dir():
+            return ToolExecutionResult(ok=False, content={
+                "error": f"'{doc_path}' is a directory, not a file."
+            })
+
+        text = full_doc_path.read_text(encoding="utf-8", errors="replace")
+        paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+
+        # Build id→paragraphs mapping via exact word-boundary match
+        id_to_paras: dict[str, list[str]] = {}
+        for para in paragraphs:
+            for id_val in ids:
+                if re.search(r"\b" + re.escape(id_val) + r"\b", para):
+                    bucket = id_to_paras.setdefault(id_val, [])
+                    if len(bucket) < 3:
+                        bucket.append(para[:800] + ("…" if len(para) > 800 else ""))
+
+        matched = len(id_to_paras)
+        truncated = matched > 100
+        results_subset = dict(list(id_to_paras.items())[:100])
+
+        # If no attribute requested, return raw paragraphs
+        if not attribute:
+            return ToolExecutionResult(ok=True, content={
+                "doc_path": doc_path,
+                "total_ids_searched": len(ids),
+                "matched_ids": matched,
+                "results_truncated_to_100": truncated,
+                "results": results_subset,
+                "hint": "Pass 'attribute' (e.g. 'gender (M/F)', 'birth year') to extract values via LLM instead of raw paragraphs.",
+            })
+
+        # LLM-based extraction: one batched call for all matched IDs
+        if model is None:
+            return ToolExecutionResult(ok=True, content={
+                "doc_path": doc_path,
+                "total_ids_searched": len(ids),
+                "matched_ids": matched,
+                "results_truncated_to_100": truncated,
+                "results": results_subset,
+                "warning": "No model available for attribute extraction — returning raw paragraphs.",
+            })
+
+        # Build extraction prompt: one block per ID
+        sections = []
+        for id_val, paras in results_subset.items():
+            combined = "\n".join(paras)
+            sections.append(f"[Entity: {id_val}]\n{combined}")
+        user_content = (
+            f"Extract attribute: {attribute}\n\n"
+            + "\n\n".join(sections)
+        )
+
+        log = get_logger()
+        log.info("  LOOKUP_EXTRACT attribute=%r over %d matched IDs", attribute, len(results_subset))
+        try:
+            response = model.complete([
+                ModelMessage(role="system", content=_LOOKUP_EXTRACT_SYSTEM_PROMPT),
+                ModelMessage(role="user", content=user_content),
+            ]).strip()
+        except Exception as exc:
+            return ToolExecutionResult(ok=False, content={"error": f"LLM extraction failed: {exc}"})
+
+        # Parse "identifier: value" lines
+        extracted: dict[str, str] = {}
+        for line in response.splitlines():
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            id_part, _, val_part = line.partition(":")
+            id_part = id_part.strip()
+            val_part = val_part.strip()
+            if id_part in results_subset:
+                extracted[id_part] = val_part
+
+        return ToolExecutionResult(ok=True, content={
+            "doc_path": doc_path,
+            "total_ids_searched": len(ids),
+            "matched_ids": matched,
+            "extracted_attribute": attribute,
+            "results_truncated_to_100": truncated,
+            "extracted": extracted,
+            "unmatched_ids": [i for i in ids if i not in id_to_paras],
+        })
+
+    return _lookup_ids_in_doc
 
 
 def _parse_exhausted_searches(prior_summaries: list[str]) -> set[tuple[str, str]]:
@@ -519,6 +722,28 @@ _TOOL_SPECS: dict[str, ToolSpec] = {
         ),
         input_schema={"code": "import os\nprint(sorted(os.listdir('.')))"},
     ),
+    "lookup_ids_in_doc": ToolSpec(
+        name="lookup_ids_in_doc",
+        description=(
+            "Find entities in a prose document that correspond to IDs from a structured table, "
+            "and optionally extract a specific attribute for each matched entity via LLM. "
+            "Queries table_name.id_column for all distinct values, scans doc_path "
+            "paragraph-by-paragraph for exact word-boundary matches, then — if 'attribute' is "
+            "provided — makes a single batched LLM call to extract that attribute from each "
+            "matched paragraph set. Works for any identifier type (numeric IDs, names, codes) "
+            "and any reference style ('Patient 43003', 'Case ID 43003', 'John Smith', etc.). "
+            "ALWAYS pass 'attribute' to get extracted values directly (e.g. 'gender (M/F)', "
+            "'year of birth', 'city of residence'). Without 'attribute', raw paragraphs are "
+            "returned and you still need to parse them yourself. "
+            "Use this BEFORE writing manual execute_python regex for any ID-to-attribute lookup."
+        ),
+        input_schema={
+            "table_name": "Laboratory",
+            "id_column": "ID",
+            "doc_path": "doc/Patient.md",
+            "attribute": "gender (M for male, F for female)",
+        },
+    ),
     "answer": ToolSpec(
         name="answer",
         description=(
@@ -535,8 +760,9 @@ _TOOL_HANDLERS = {
     "list_context": _list_context,
     "read_doc": _read_doc,
     "read_knowledge_section": _read_knowledge_section,
-    # search_doc is NOT included here — it's created per-task via _make_search_doc
-    # to allow per-attempt blocked search sets.  See create_data_agent_tool_registry.
+    # search_doc and lookup_ids_in_doc are NOT included here — both are created
+    # per-task via factories that capture model/task/blocked-search state.
+    # See create_data_agent_tool_registry.
     "show_context_schema": _show_context_schema,
     "query_context_tables": _query_context_tables,
     "execute_python": _execute_python,
@@ -587,6 +813,11 @@ def create_data_agent_tool_registry(
             ok=False, content={"error": "search_doc requires task context."}
         )
 
+    # lookup_ids_in_doc is wired here so it captures the model for LLM-based
+    # attribute extraction.  Without a model it still works (returns raw paragraphs).
+    _lookup_impl = _make_lookup_ids_in_doc(model)
+    handlers["lookup_ids_in_doc"] = _lookup_impl
+
     if model is not None:
         def _consult_domain_knowledge(_task: PublicTask, action_input: dict) -> ToolExecutionResult:
             question = str(action_input.get("question", "")).strip()
@@ -606,9 +837,12 @@ def create_data_agent_tool_registry(
                         "answer": answer.strip(),
                         "source": "model_training_knowledge",
                         "next_step": (
-                            "IMPORTANT: before applying any threshold from this answer, run "
-                            "SELECT MIN(col), MAX(col), AVG(col) on the actual data column "
-                            "to verify the units match. Scale the threshold if needed."
+                            "IMPORTANT: run SELECT MIN(col), MAX(col), AVG(col) on the actual "
+                            "data column to verify units match. Then apply the "
+                            "DISTRIBUTION-BASED ABNORMALITY RULE from your instructions: if ALL "
+                            "non-empty values fall entirely outside the reference range on one "
+                            "side, treat every non-empty value as abnormal and filter with "
+                            "WHERE col IS NOT NULL AND col != '' — do not keep searching."
                         ),
                     },
                 )
@@ -781,6 +1015,22 @@ def summarise_trace_for_resumption(trace_dict: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_context_files(input_files: dict) -> str:
+    """Format the authoritative list of context files for injection into the task prompt.
+
+    Excludes 'other' category (e.g. .DS_Store) and any blank entries.
+    The block is prepended to the task hint so the model sees exactly which
+    files exist before it starts reasoning — preventing path hallucination.
+    """
+    lines = ["[Available context files — this is the complete list]"]
+    for category in ("csv", "db", "json", "doc"):
+        for path in input_files.get(category, []):
+            if path:
+                lines.append(f"  [{category}] {path}")
+    lines.append("Do not attempt to read any file not listed above.")
+    return "\n".join(lines)
+
+
 def _format_prior_attempts(summaries: list[str]) -> str:
     """Format one or more prior attempt summaries as a block for the task prompt."""
     if not summaries:
@@ -848,18 +1098,24 @@ class DataAgent:
         def _run_preflight() -> None:
             try:
                 schema = build_schema_profile(task.context_dir, question=task.question)
-                analysis = build_task_analysis(task.question, schema, task.context_dir)
+                analysis = build_task_analysis(
+                    task.question, schema, task.context_dir, model=self.model
+                )
                 hint = format_task_analysis_hint(analysis)
                 task_analysis.update(analysis)
                 _preflight_result["hint"] = hint
             except Exception as exc:
                 log.warning("PREFLIGHT error: %s", exc)
 
-        log.info("PREFLIGHT start (budget=%ds)", self.preflight_timeout_seconds)
+        from data_agent_baseline.tools.task_analyzer import count_doc_files  # noqa: PLC0415
+        n_docs = count_doc_files(task.context_dir)
+        n_batches = max(1, (n_docs + 1) // 2)
+        dynamic_preflight_secs = self.preflight_timeout_seconds + (n_batches - 1) * 30
+        log.info("PREFLIGHT start (budget=%ds, docs=%d, batches=%d)", dynamic_preflight_secs, n_docs, n_batches)
         _preflight_result: dict = {}
         _t = threading.Thread(target=_run_preflight, daemon=True)
         _t.start()
-        _t.join(timeout=self.preflight_timeout_seconds)
+        _t.join(timeout=dynamic_preflight_secs)
         task_hint = _preflight_result.get("hint")
         if task_hint:
             log.info("PREFLIGHT done: hint=%d chars", len(task_hint))
@@ -870,6 +1126,14 @@ class DataAgent:
             "hint": task_hint or "",
             "task_analysis": dict(task_analysis),
         }
+
+        # Prepend the authoritative file listing so the model knows exactly
+        # which paths exist before it starts reasoning.  This prevents it from
+        # hallucinating file paths (e.g. assuming doc/Laboratory.md when only
+        # csv/Laboratory.csv is present) which causes infinite error loops.
+        input_files = detect_input_files(task)
+        file_listing = _format_context_files(input_files)
+        task_hint = (file_listing + "\n\n" + task_hint) if task_hint else file_listing
 
         # Extract exhausted searches from prior summaries and hard-block them.
         # This prevents the model from repeating search_doc calls that already
