@@ -213,6 +213,7 @@ def run_benchmark_command(
         completion_count = 0
         succeeded_count = 0
         failed_count = 0
+        failed_task_ids: set[str] = set()
         start_time = perf_counter()
 
         def on_task_complete(artifact) -> None:
@@ -220,8 +221,14 @@ def run_benchmark_command(
             completion_count += 1
             if artifact.succeeded:
                 succeeded_count += 1
+                # If this task was previously counted as failed (retry succeeded),
+                # decrement the failure counter so the display stays accurate.
+                if artifact.task_id in failed_task_ids:
+                    failed_count -= 1
+                    failed_task_ids.discard(artifact.task_id)
             else:
                 failed_count += 1
+                failed_task_ids.add(artifact.task_id)
             progress.update(
                 progress_task_id,
                 completed=completion_count,

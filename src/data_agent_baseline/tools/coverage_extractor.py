@@ -20,6 +20,7 @@ Design principles
 """
 from __future__ import annotations
 
+import csv
 import re
 import sqlite3
 import time
@@ -227,8 +228,13 @@ def _inject_complete(
     conn: sqlite3.Connection,
     pair: dict,
     extracted: dict[str, str],
+    cache_dir: Path | None = None,
 ) -> str:
-    """Create <lookup>_complete table = existing lookup rows + extracted rows."""
+    """Create <lookup>_complete table = existing lookup rows + extracted rows.
+
+    If *cache_dir* is provided the merged table is also written as a CSV so it
+    can be restored in resumption subprocesses (which skip preflight).
+    """
     lookup = pair["lookup_table"]
     lid_col = pair["lookup_id_col"]
     attr_cols = pair["attr_cols"]
@@ -266,7 +272,53 @@ def _inject_complete(
     except Exception:
         return lookup  # fallback: use original table name
 
+    # Persist to disk so resumption subprocesses can restore without re-extracting.
+    if cache_dir is not None and merged:
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            csv_path = cache_dir / f"extracted_{complete_name}.csv"
+            with open(csv_path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=cols)
+                writer.writeheader()
+                writer.writerows({c: row.get(c, "") for c in cols} for row in merged)
+        except Exception:
+            pass  # disk write failure is non-fatal
+
     return complete_name
+
+
+def load_cached_extractions(cache_dir: Path, conn: sqlite3.Connection) -> list[str]:
+    """Restore pre-extracted *_complete tables from disk CSVs into SQLite.
+
+    Called during resumption subprocesses (which skip preflight) to make the
+    tables available without re-running the LLM extraction.
+
+    Returns the list of table names that were successfully restored.
+    """
+    restored: list[str] = []
+    for csv_path in sorted(cache_dir.glob("extracted_*.csv")):
+        table_name = csv_path.stem[len("extracted_"):]  # strip "extracted_" prefix
+        try:
+            with open(csv_path, encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+            if not rows:
+                continue
+            cols = list(rows[0].keys())
+            conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+            col_defs = ", ".join('"' + c + '" TEXT' for c in cols)
+            conn.execute(f'CREATE TABLE "{table_name}" ({col_defs})')
+            conn.executemany(
+                'INSERT INTO "' + table_name + '" (' +
+                ", ".join('"' + c + '"' for c in cols) + ") VALUES (" +
+                ", ".join("?" for _ in cols) + ")",
+                [[r.get(c, "") for c in cols] for r in rows],
+            )
+            conn.commit()
+            restored.append(table_name)
+        except Exception:
+            pass
+    return restored
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +329,7 @@ def detect_and_extract_coverage_gaps(
     context_dir: Path,
     model: "ModelAdapter | None",
     timeout_seconds: int = 25,
+    cache_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Run gap detection + prose extraction and return summaries for the preflight hint.
 
@@ -328,7 +381,7 @@ def detect_and_extract_coverage_gaps(
         if not extracted:
             continue
 
-        complete_name = _inject_complete(conn, pair, extracted)
+        complete_name = _inject_complete(conn, pair, extracted, cache_dir=cache_dir)
 
         summaries.append({
             "fact_table": pair["fact_table"],

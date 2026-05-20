@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import threading
 from datetime import datetime
+from pathlib import Path
 
 from data_agent_baseline.agents.model import ModelAdapter, ModelMessage
 from data_agent_baseline.agents.react import ReActAgent, ReActAgentConfig
@@ -172,17 +173,12 @@ Step 4 — Query and analyse:
     (you get "no such table" error), use execute_python to load the relevant .md or
     .csv file into a pandas DataFrame and run the analysis there. Do not give up after
     a "no such table" error — the data may live in a doc file.
-  - Standard domain thresholds: first search ALL context files (knowledge.md, every doc/,
-    every CSV header, every table) for explicitly defined thresholds. Only if none are
-    found anywhere in the context, use consult_domain_knowledge to retrieve well-known
-    reference values (e.g. clinical normal ranges, physical constants, industry standards).
-    IMPORTANT: if you have already made 5 or more doc/knowledge searches for the same
-    threshold and found nothing, treat the search as exhausted — do NOT repeat the same search.
-    Call consult_domain_knowledge immediately with a precise question about the threshold.
-    After receiving a threshold from consult_domain_knowledge, ALWAYS verify units by
-    running SELECT MIN(col), MAX(col), AVG(col) on the actual data column first. The
-    general knowledge threshold may be in different units than the dataset (e.g. cells/µL
-    vs ×10⁹/L). Scale the threshold to match what you observe in the data before filtering.
+  - Standard domain thresholds: use lookup_reference_range to find any lab or clinical
+    reference range in one step. It searches all context docs first, then falls back to
+    domain knowledge automatically — you do NOT need to call search_doc multiple times.
+    After receiving a range, ALWAYS verify units by running SELECT MIN(col), MAX(col), AVG(col)
+    on the actual data column first. The threshold may be in different units than the dataset
+    (e.g. cells/µL vs ×10⁹/L). Scale the threshold to match what you observe in the data.
 
     DISTRIBUTION-BASED ABNORMALITY RULE: After checking MIN/MAX/AVG, if you find that
     ALL non-empty values in the column fall entirely outside the known reference range on
@@ -686,6 +682,18 @@ _TOOL_SPECS: dict[str, ToolSpec] = {
         ),
         input_schema={"code": "import os\nprint(sorted(os.listdir('.')))"},
     ),
+    "lookup_reference_range": ToolSpec(
+        name="lookup_reference_range",
+        description=(
+            "Look up the standard reference range (normal/abnormal threshold) for a column. "
+            "Searches all context doc files first (up to 3 attempts per file). "
+            "If nothing found in docs, falls back to domain knowledge. "
+            "Use this INSTEAD of making multiple search_doc calls for a threshold — "
+            "it returns a definitive range in one step. "
+            "Always verify units against SELECT MIN(col), MAX(col) after receiving the range."
+        ),
+        input_schema={"column": "WBC", "question_context": "normal range for white blood cells"},
+    ),
     "answer": ToolSpec(
         name="answer",
         description=(
@@ -804,6 +812,88 @@ def create_data_agent_tool_registry(
             input_schema={"question": "What is the normal range for creatinine in mg/dL?"},
         )
         handlers["consult_domain_knowledge"] = _consult_domain_knowledge
+
+        # lookup_reference_range: searches doc files (max 3 per file) then
+        # falls back to domain knowledge — saves the agent many search_doc steps.
+        def _make_lookup_reference_range(task_inner=task):
+            def _lookup_reference_range_impl(_task: "PublicTask", action_input: dict) -> ToolExecutionResult:
+                column = str(action_input.get("column", "")).strip()
+                question_context = str(action_input.get("question_context", "")).strip()
+                if not column:
+                    return ToolExecutionResult(ok=False, content={"error": "'column' is required."})
+
+                log_inner = get_logger()
+                col_lower = column.lower()
+
+                # --- Phase 1: search doc files (max 3 keyword variants per file) ---
+                search_hits: list[str] = []
+                doc_dir = task_inner.context_dir / "doc"
+                if doc_dir.is_dir():
+                    range_keywords = {"normal", "range", "threshold", "above", "below", "limit", "reference"}
+                    for doc_file in sorted(doc_dir.glob("*.md")):
+                        text = doc_file.read_text(encoding="utf-8", errors="replace")
+                        text_lower = text.lower()
+                        variants = [col_lower, column.upper(), question_context.lower()[:25]]
+                        found_in_file = False
+                        for variant in variants[:3]:
+                            if variant.lower() in text_lower:
+                                for para in text.split("\n\n"):
+                                    if variant.lower() in para.lower() and range_keywords & set(para.lower().split()):
+                                        search_hits.append(f"[{doc_file.name}]: {para.strip()[:500]}")
+                                        found_in_file = True
+                                        break
+                            if found_in_file:
+                                break
+
+                if search_hits:
+                    log_inner.info("  LOOKUP_RANGE found in docs for column=%r", column)
+                    prompt = (
+                        f"From the text below, extract the standard reference range for '{column}' "
+                        f"(context: {question_context}). "
+                        f"Return ONLY the range — e.g. '4.5–11.0 ×10⁹/L' or 'below 200 mg/dL'. "
+                        f"If multiple ranges exist, list all briefly.\n\n"
+                        + "\n\n".join(search_hits)
+                    )
+                    try:
+                        range_str = model.complete([ModelMessage(role="user", content=prompt)]).strip()
+                        return ToolExecutionResult(ok=True, content={
+                            "column": column,
+                            "range": range_str,
+                            "source": "context_documents",
+                            "next_step": (
+                                "Verify units: run SELECT MIN(col), MAX(col), AVG(col) on the actual "
+                                "data column to confirm the range matches the dataset's scale."
+                            ),
+                        })
+                    except Exception:
+                        pass  # fall through to domain knowledge
+
+                # --- Phase 2: domain knowledge fallback ---
+                log_inner.info("  LOOKUP_RANGE fallback to domain knowledge for column=%r", column)
+                domain_q = (
+                    f"What is the standard clinical reference range for '{column}' "
+                    f"({question_context})? Give ONLY the normal range in concise standard units."
+                )
+                try:
+                    range_str = model.complete([
+                        ModelMessage(role="system", content=_DOMAIN_KNOWLEDGE_SYSTEM_PROMPT),
+                        ModelMessage(role="user", content=domain_q),
+                    ]).strip()
+                    return ToolExecutionResult(ok=True, content={
+                        "column": column,
+                        "range": range_str,
+                        "source": "domain_knowledge",
+                        "next_step": (
+                            "IMPORTANT: verify units by running SELECT MIN(col), MAX(col), AVG(col) "
+                            "on the actual data column before applying this threshold. "
+                            "Domain knowledge values may be in different units than the dataset."
+                        ),
+                    })
+                except Exception as exc:
+                    return ToolExecutionResult(ok=False, content={"error": str(exc)})
+            return _lookup_reference_range_impl
+
+        handlers["lookup_reference_range"] = _make_lookup_reference_range()
 
     return ToolRegistry(specs=specs, handlers=handlers)
 
@@ -993,16 +1083,20 @@ class DataAgent:
     present in the context.
     """
 
+    _EXTRACTOR_TIMEOUT_SECONDS = 25  # additive budget beyond base preflight
+
     def __init__(
         self,
         *,
         model: ModelAdapter,
         max_steps: int = 16,
         preflight_timeout_seconds: int = 30,
+        cache_dir: "Path | None" = None,
     ) -> None:
         self.model = model
         self.max_steps = max_steps
         self.preflight_timeout_seconds = preflight_timeout_seconds
+        self._cache_dir = cache_dir
 
     def run(self, task: PublicTask, prior_attempts: list[str] | None = None):
         """Run the agent on a task.
@@ -1035,7 +1129,8 @@ class DataAgent:
             try:
                 schema = build_schema_profile(task.context_dir, question=task.question)
                 analysis = build_task_analysis(
-                    task.question, schema, task.context_dir, model=self.model
+                    task.question, schema, task.context_dir, model=self.model,
+                    cache_dir=self._cache_dir,
                 )
                 hint = format_task_analysis_hint(analysis)
                 task_analysis.update(analysis)
@@ -1046,7 +1141,12 @@ class DataAgent:
         from data_agent_baseline.tools.task_analyzer import count_doc_files  # noqa: PLC0415
         n_docs = count_doc_files(task.context_dir)
         n_batches = max(1, (n_docs + 1) // 2)
-        dynamic_preflight_secs = self.preflight_timeout_seconds + (n_batches - 1) * 30
+        # Extractor timeout is additive on top of the base preflight budget.
+        dynamic_preflight_secs = (
+            self.preflight_timeout_seconds
+            + (n_batches - 1) * 30
+            + self._EXTRACTOR_TIMEOUT_SECONDS
+        )
         log.info("PREFLIGHT start (budget=%ds, docs=%d, batches=%d)", dynamic_preflight_secs, n_docs, n_batches)
         _preflight_result: dict = {}
         _t = threading.Thread(target=_run_preflight, daemon=True)
@@ -1063,12 +1163,34 @@ class DataAgent:
             "task_analysis": dict(task_analysis),
         }
 
+        # On resumption (preflight skipped): restore *_complete tables from the
+        # disk cache written during the first attempt.  Without this, the resumed
+        # subprocess starts with a fresh in-memory SQLite that is missing any
+        # tables injected by the extractor, causing "no such table" errors.
+        restored_tables: list[str] = []
+        if self.preflight_timeout_seconds == 0 and self._cache_dir is not None:
+            try:
+                from data_agent_baseline.tools.context_sqlite import load_context_to_sqlite  # noqa: PLC0415
+                from data_agent_baseline.tools.coverage_extractor import load_cached_extractions  # noqa: PLC0415
+                conn = load_context_to_sqlite(task.context_dir)
+                restored_tables = load_cached_extractions(self._cache_dir, conn)
+                if restored_tables:
+                    log.info("RESUMPTION: restored extracted tables: %s", restored_tables)
+            except Exception as exc:
+                log.warning("RESUMPTION: failed to restore cached extractions: %s", exc)
+
         # Prepend the authoritative file listing so the model knows exactly
         # which paths exist before it starts reasoning.  This prevents it from
         # hallucinating file paths (e.g. assuming doc/Laboratory.md when only
         # csv/Laboratory.csv is present) which causes infinite error loops.
         input_files = detect_input_files(task)
         file_listing = _format_context_files(input_files)
+        if restored_tables:
+            file_listing += (
+                "\n[Restored pre-extracted tables: "
+                + ", ".join(f"'{t}'" for t in restored_tables)
+                + " — these are available in the SQL context. Use them as directed by the prior attempt summary.]"
+            )
         task_hint = (file_listing + "\n\n" + task_hint) if task_hint else file_listing
 
         # Extract exhausted searches from prior summaries and hard-block them.

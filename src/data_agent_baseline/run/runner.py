@@ -202,10 +202,14 @@ def _run_one_attempt_core(
     # schema via the prior_summaries block, so re-running preflight wastes budget.
     preflight_secs = config.run.preflight_timeout_seconds if is_first_attempt else 0
     effective_max_steps = override_max_steps if override_max_steps is not None else config.agent.max_steps
+    # cache_dir stores extracted *_complete CSVs so resumptions can restore them.
+    cache_dir = Path(config.run.output_dir) / config.run.run_id / task_id
+    cache_dir.mkdir(parents=True, exist_ok=True)
     agent = DataAgent(
         model=model_instance,
         max_steps=effective_max_steps,
         preflight_timeout_seconds=preflight_secs,
+        cache_dir=cache_dir,
     )
 
     run_result = agent.run(task, prior_attempts=prior_summaries or []).to_dict()
@@ -365,9 +369,11 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
         _context_dir = Path(config.dataset.root_path) / task_id / "context"
         _n_docs = count_doc_files(_context_dir)
         _n_batches = max(1, (_n_docs + 1) // 2)
-        preflight_budget = _base_preflight + (_n_batches - 1) * 30
+        # Extractor timeout is additive on top of the base preflight budget.
+        from data_agent_baseline.agents.data_agent import DataAgent as _DA  # noqa: PLC0415
+        preflight_budget = _base_preflight + (_n_batches - 1) * 30 + _DA._EXTRACTOR_TIMEOUT_SECONDS
     except Exception:
-        preflight_budget = _base_preflight
+        preflight_budget = _base_preflight + 25  # fallback: add default extractor budget
     _MAX_FILTER_RECOVERIES = 5  # safety cap: avoid infinite content-filter loops
 
     prior_summaries: list[str] = []

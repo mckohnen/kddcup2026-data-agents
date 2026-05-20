@@ -467,6 +467,7 @@ def build_task_analysis(
     context: dict,
     context_dir: "Path",
     model: "ModelAdapter | None" = None,
+    cache_dir: "Path | None" = None,
 ) -> dict[str, Any]:
     """Analyse a question against the context schema and data.
 
@@ -541,9 +542,36 @@ def build_task_analysis(
                 context_dir=context_dir,
                 model=model,
                 timeout_seconds=25,
+                cache_dir=cache_dir,
             )
         except Exception:
             pass
+
+    # Add complete tables to context so column/table matching includes them.
+    # This means schema hints will reference patient_sex_complete instead of
+    # (or in addition to) patient_sex when the question references those columns.
+    schema_tables = list(context.get("tables", {}).keys())
+    if extracted_tables:
+        for et in extracted_tables:
+            complete_name = et["complete_table"]
+            lookup_name = et["lookup_table"]
+            if lookup_name in context.get("tables", {}) and complete_name not in context.get("tables", {}):
+                context["tables"][complete_name] = dict(context["tables"][lookup_name])
+        # Re-run table/column matching so complete table shows in candidate hints
+        extra_table_matches = _match_tables(question, context)
+        extra_col_matches = _match_columns(question, context)
+        existing_keys = {json.dumps(m, sort_keys=True) for m in all_matches}
+        for m in _dedupe(extra_table_matches + extra_col_matches):
+            k = json.dumps(m, sort_keys=True)
+            if k not in existing_keys:
+                all_matches.append(m)
+                t = m.get("matched_table")
+                if t and t not in candidate_tables:
+                    candidate_tables.append(t)
+                t2, c = m.get("matched_table"), m.get("matched_column")
+                if t2 and c and f"{t2}.{c}" not in candidate_columns:
+                    candidate_columns.append(f"{t2}.{c}")
+        schema_tables = list(context.get("tables", {}).keys())
 
     return {
         "question": question,
@@ -557,7 +585,7 @@ def build_task_analysis(
         "doc_contents": doc_contents,
         "knowledge_content": knowledge_content,
         "extracted_tables": extracted_tables,
-        "_schema_tables": list(context.get("tables", {}).keys()),
+        "_schema_tables": schema_tables,
     }
 
 
