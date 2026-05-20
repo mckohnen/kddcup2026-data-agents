@@ -1,6 +1,9 @@
 dataset:
   root_path: data/public/input        # path to the task_*/ input directories
 
+env:
+  FASTEMBED_CACHE_PATH: models/fastembed # path for the embedding model
+
 agent:
   model: YOUR_MODEL_NAME
   api_base: YOUR_API_BASE_URL

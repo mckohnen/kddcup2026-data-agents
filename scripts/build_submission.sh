@@ -16,6 +16,14 @@ ARCHIVE="${TEAM_ID}_v${VERSION}.tar.gz"
 # Move to repo root regardless of where the script is called from.
 cd "$(dirname "$0")/.."
 
+# Ensure fastembed model weights are present before building the image.
+# The Dockerfile COPYs models/fastembed/ into the image; without it the build fails.
+if [ ! -d "models/fastembed" ]; then
+  echo "ERROR: models/fastembed/ not found."
+  echo "Run 'uv run python scripts/download_models.py' first to download the model weights."
+  exit 1
+fi
+
 echo "==> Building image: ${IMAGE}"
 docker build --platform linux/amd64 -t "${IMAGE}" .
 
