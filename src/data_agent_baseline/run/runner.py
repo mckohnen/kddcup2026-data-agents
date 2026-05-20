@@ -15,6 +15,7 @@ from data_agent_baseline.agents.data_agent import DataAgent, summarise_trace_for
 from data_agent_baseline.agents.model import OpenAIModelAdapter
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.config import AppConfig
+from data_agent_baseline.task_logger import close_task_logger, setup_task_logger
 from data_agent_baseline.tools.input_detector import detect_input_files
 from data_agent_baseline.tools.registry import ToolRegistry, create_default_tool_registry
 
@@ -168,6 +169,8 @@ def _run_single_task_core(
     run_result: dict[str, Any] = _failure_run_result_payload(task_id, "No attempts were made.")
 
     for attempt_idx in range(len(attempt_timeouts)):
+        log_path = Path(str(config.run.output_dir)) / config.run.run_id / task_id / "agent.log"
+        setup_task_logger(log_path, attempt=attempt_idx + 1)
         run_result = _run_one_attempt_core(
             task_id=task_id,
             config=config,
@@ -204,6 +207,8 @@ def _run_one_attempt_in_subprocess(
     attempt_idx: int,
     queue: multiprocessing.Queue[Any],
 ) -> None:
+    log_path = Path(str(config.run.output_dir)) / config.run.run_id / task_id / "agent.log"
+    setup_task_logger(log_path, attempt=attempt_idx + 1)
     try:
         queue.put(
             {
@@ -218,6 +223,8 @@ def _run_one_attempt_in_subprocess(
         )
     except BaseException as exc:  # noqa: BLE001
         queue.put({"ok": False, "error": str(exc)})
+    finally:
+        close_task_logger()
 
 
 def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[str, Any]:
@@ -338,6 +345,11 @@ def _write_task_outputs(task_id: str, run_output_dir: Path, run_result: dict[str
             list(answer.get("columns", [])),
             [list(row) for row in answer.get("rows", [])],
         )
+        # Drop the log for tasks that completed successfully — keeps disk usage
+        # low across 367 tasks while preserving logs for failures that need debugging.
+        log_path = task_output_dir / "agent.log"
+        if log_path.exists():
+            log_path.unlink(missing_ok=True)
 
     return TaskRunArtifacts(
         task_id=task_id,

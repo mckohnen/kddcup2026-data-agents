@@ -6,6 +6,7 @@ from datetime import datetime
 
 from data_agent_baseline.agents.model import ModelAdapter
 from data_agent_baseline.agents.react import ReActAgent, ReActAgentConfig
+from data_agent_baseline.task_logger import get_logger
 from data_agent_baseline.benchmark.schema import AnswerTable, PublicTask
 from data_agent_baseline.tools.context_sqlite import run_sql_on_context
 from data_agent_baseline.tools.filesystem import (
@@ -621,6 +622,9 @@ class DataAgent:
         # before the agent runs a single step.  If the timeout fires, the agent
         # continues without hints — always better than timing out with 0 steps.
 
+        log = get_logger()
+        log.info("TASK %s | question=%r", task.task_id, task.question[:120])
+
         task_hint: str | None = None
         task_analysis: dict = {}
 
@@ -631,14 +635,19 @@ class DataAgent:
                 hint = format_task_analysis_hint(analysis)
                 task_analysis.update(analysis)
                 _preflight_result["hint"] = hint
-            except Exception:
-                pass  # Never let analysis failure block the agent run
+            except Exception as exc:
+                log.warning("PREFLIGHT error: %s", exc)
 
+        log.info("PREFLIGHT start (budget=%ds)", self.preflight_timeout_seconds)
         _preflight_result: dict = {}
         _t = threading.Thread(target=_run_preflight, daemon=True)
         _t.start()
         _t.join(timeout=self.preflight_timeout_seconds)
         task_hint = _preflight_result.get("hint")
+        if task_hint:
+            log.info("PREFLIGHT done: hint=%d chars", len(task_hint))
+        else:
+            log.warning("PREFLIGHT timed out or produced no hint")
         # Store for the caller (runner.py saves this as preflight.json).
         self._last_preflight: dict = {
             "hint": task_hint or "",

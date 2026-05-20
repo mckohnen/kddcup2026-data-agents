@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 
 from data_agent_baseline.agents.model import ModelAdapter, ModelMessage, ModelStep
+from data_agent_baseline.task_logger import get_logger
 from data_agent_baseline.agents.prompt import (
     REACT_SYSTEM_PROMPT,
     build_observation_prompt,
@@ -304,12 +306,22 @@ class ReActAgent:
         return messages
 
     def run(self, task: PublicTask) -> AgentRunResult:
+        log = get_logger()
         state = AgentRuntimeState()
         for step_index in range(1, self.config.max_steps + 1):
             raw_response = ""  # safe default — ensures the except branch has a valid value
             try:
-                raw_response = self.model.complete(self._build_messages(task, state))
+                messages = self._build_messages(task, state)
+                ctx_chars = sum(len(m.content) for m in messages)
+                log.info("STEP %d/%d | context %d chars (%d msgs)", step_index, self.config.max_steps, ctx_chars, len(messages))
+
+                t0 = time.perf_counter()
+                raw_response = self.model.complete(messages)
+                llm_elapsed = time.perf_counter() - t0
                 model_step = parse_model_step(raw_response)
+
+                thought_preview = model_step.thought[:120].replace("\n", " ")
+                log.info("  action=%s thought=%r llm=%.1fs", model_step.action, thought_preview, llm_elapsed)
 
                 # --- Critic gate: review proposed answers before executing them ---
                 if self.enable_answer_critic and model_step.action == "answer":
@@ -320,7 +332,7 @@ class ReActAgent:
                         task_analysis=self.task_analysis,
                     )
                     if concern:
-                        # Inject the concern as a tool error so the agent can revise
+                        log.warning("  CRITIC BLOCKED: %s", concern)
                         observation = {
                             "ok": False,
                             "tool": "answer",
@@ -345,7 +357,12 @@ class ReActAgent:
                         continue
                 # -----------------------------------------------------------------
 
+                t0 = time.perf_counter()
                 tool_result = self.tools.execute(task, model_step.action, model_step.action_input)
+                tool_elapsed = time.perf_counter() - t0
+                result_chars = len(str(tool_result.content))
+                log.info("  tool=%s ok=%s result=%d chars tool=%.2fs", model_step.action, tool_result.ok, result_chars, tool_elapsed)
+
                 observation = {
                     "ok": tool_result.ok,
                     "tool": model_step.action,
@@ -363,6 +380,7 @@ class ReActAgent:
                 state.steps.append(step_record)
                 if tool_result.is_terminal:
                     state.answer = tool_result.answer
+                    log.info("DONE answer accepted at step %d", step_index)
                     break
             except Exception as exc:
                 # Layer 1: attempt silent JSON repair before recording the error.
@@ -370,9 +388,13 @@ class ReActAgent:
                 if repaired is not None:
                     try:
                         model_step = parse_model_step(repaired)
+                        log.warning("  JSON repaired — retrying action=%s", model_step.action)
+                        t0 = time.perf_counter()
                         tool_result = self.tools.execute(
                             task, model_step.action, model_step.action_input
                         )
+                        tool_elapsed = time.perf_counter() - t0
+                        log.info("  tool=%s ok=%s tool=%.2fs (after repair)", model_step.action, tool_result.ok, tool_elapsed)
                         observation = {
                             "ok": tool_result.ok,
                             "tool": model_step.action,
@@ -390,6 +412,7 @@ class ReActAgent:
                         state.steps.append(step_record)
                         if tool_result.is_terminal:
                             state.answer = tool_result.answer
+                            log.info("DONE answer accepted at step %d (after repair)", step_index)
                             break
                         continue
                     except Exception:
@@ -397,6 +420,7 @@ class ReActAgent:
 
                 # Layer 2: record the error; _build_messages will inject the recovery hint
                 # as the next user message so the model knows exactly what went wrong.
+                log.error("  PARSE ERROR step=%d: %s", step_index, exc)
                 observation = {
                     "ok": False,
                     "error": str(exc),
@@ -415,6 +439,7 @@ class ReActAgent:
 
         if state.answer is None and state.failure_reason is None:
             state.failure_reason = "Agent did not submit an answer within max_steps."
+            log.warning("FAILED max_steps=%d exhausted", self.config.max_steps)
 
         return AgentRunResult(
             task_id=task.task_id,

@@ -8,6 +8,8 @@ from typing import Any, Protocol
 import httpx
 from openai import APIConnectionError, APIError, OpenAI, RateLimitError
 
+from data_agent_baseline.task_logger import get_logger
+
 
 @dataclass(frozen=True, slots=True)
 class ModelMessage:
@@ -73,6 +75,10 @@ class OpenAIModelAdapter:
         if not self.api_key:
             raise RuntimeError("Missing model API key in config.agent.api_key.")
 
+        log = get_logger()
+        total_prompt_chars = sum(len(m.content) for m in messages)
+        log.debug("  LLM request: %d msgs, %d chars total", len(messages), total_prompt_chars)
+
         last_exc: Exception | None = None
         for attempt in range(_MAX_RETRIES):
             try:
@@ -86,15 +92,15 @@ class OpenAIModelAdapter:
                 if attempt >= _MAX_RETRIES - 1:
                     break  # exhausted retries — raise below
                 delay = _retry_delay(exc, attempt)
+                log.warning("  LLM RateLimitError (attempt %d/%d), retry in %.1fs", attempt + 1, _MAX_RETRIES, delay)
                 time.sleep(delay)
                 continue
             except APIConnectionError as exc:
-                # Covers network errors, connection resets, and read timeouts.
-                # These are transient — retry with backoff just like rate limits.
                 last_exc = exc
                 if attempt >= _MAX_RETRIES - 1:
                     break
                 delay = _retry_delay(exc, attempt)
+                log.warning("  LLM APIConnectionError (attempt %d/%d), retry in %.1fs: %s", attempt + 1, _MAX_RETRIES, delay, exc)
                 time.sleep(delay)
                 continue
             except APIError as exc:
@@ -110,6 +116,9 @@ class OpenAIModelAdapter:
             if response.usage:
                 self.total_input_tokens += response.usage.prompt_tokens
                 self.total_output_tokens += response.usage.completion_tokens
+                log.debug("  LLM response: %d chars | tokens in=%d out=%d (cumulative in=%d out=%d)",
+                          len(content), response.usage.prompt_tokens, response.usage.completion_tokens,
+                          self.total_input_tokens, self.total_output_tokens)
 
             return content
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -51,6 +52,7 @@ class AppConfig:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     run: RunConfig = field(default_factory=RunConfig)
+    env: dict[str, str] = field(default_factory=dict)
 
 
 def _path_value(raw_value: str | None, default_value: Path) -> Path:
@@ -100,4 +102,16 @@ def load_app_config(config_path: Path) -> AppConfig:
         max_resumptions=int(run_payload.get("max_resumptions", run_defaults.max_resumptions)),
         task_timeout_seconds_per_attempt=per_attempt,
     )
-    return AppConfig(dataset=dataset_config, agent=agent_config, run=run_config)
+    env: dict[str, str] = {}
+    for key, value in payload.get("env", {}).items():
+        str_val = str(value)
+        # Resolve relative paths against the project root so configs are portable.
+        candidate = Path(str_val)
+        if not candidate.is_absolute():
+            resolved = (PROJECT_ROOT / candidate).resolve()
+            if resolved.exists():
+                str_val = str(resolved)
+        env[str(key)] = str_val
+    os.environ.update(env)
+
+    return AppConfig(dataset=dataset_config, agent=agent_config, run=run_config, env=env)
