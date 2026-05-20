@@ -80,7 +80,10 @@ task.json + context/  →  InputDetector  →  DataAgent  →  prediction.csv
 
 ```bash
 uv sync
+uv run python scripts/download_models.py   # one-time: downloads fastembed weights to models/fastembed/
 ```
+
+Model weights are gitignored (binary blobs, ~130 MB). Every developer must run this once. The `build_submission.sh` script will error if the weights are missing.
 
 ### Config files
 
