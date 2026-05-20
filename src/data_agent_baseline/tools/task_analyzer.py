@@ -364,6 +364,49 @@ def _check_id_coverage(context: dict, context_dir: "Path") -> list[dict]:
 
 _DOC_SCAN_CHARS = 2000  # chars read from each doc file — first paragraph reveals structure
 
+_KNOWLEDGE_EXTRACT_SYSTEM_PROMPT = (
+    "You are a precise knowledge extraction assistant. "
+    "Given a data analysis question and a knowledge document, extract ONLY the parts "
+    "that are directly useful for answering the question. "
+    "Keep: column definitions, value encodings, and example SQL queries that relate to "
+    "the entities, filters, or metrics mentioned in the question. "
+    "Discard: sections about unrelated metrics, unrelated entities, and examples that "
+    "do not involve any term from the question. "
+    "Preserve original wording — do not paraphrase or summarise. "
+    "Output only the extracted text with no preamble. "
+    "If nothing is relevant, output the single word: NONE"
+)
+
+_KNOWLEDGE_MIN_CHARS_TO_FILTER = 600  # skip LLM call for short documents
+
+
+def _extract_relevant_knowledge(
+    question: str,
+    knowledge_content: str,
+    model: "ModelAdapter",
+) -> str:
+    """Return the subset of knowledge_content relevant to the question.
+
+    Falls back to the full content on LLM failure or if the document is short.
+    """
+    from data_agent_baseline.agents.model import ModelMessage  # noqa: PLC0415
+
+    if len(knowledge_content) < _KNOWLEDGE_MIN_CHARS_TO_FILTER:
+        return knowledge_content
+
+    prompt = f"Question: {question}\n\nKnowledge document:\n{knowledge_content}"
+    try:
+        result = model.complete([
+            ModelMessage(role="system", content=_KNOWLEDGE_EXTRACT_SYSTEM_PROMPT),
+            ModelMessage(role="user", content=prompt),
+        ]).strip()
+        if result and result.upper() != "NONE" and len(result) >= 50:
+            return result
+    except Exception:
+        pass
+    return knowledge_content  # fallback to full content
+
+
 _DOC_SCAN_SYSTEM_PROMPT = (
     "You are a data analyst. You will be shown opening excerpts from one or more data documents. "
     "For each document, output exactly one line in the format:\n"
@@ -526,7 +569,12 @@ def build_task_analysis(
         knowledge_path = context_dir / "doc" / "knowledge.md"
     if knowledge_path.exists():
         try:
-            knowledge_content = knowledge_path.read_text(encoding="utf-8", errors="replace").strip()
+            raw_knowledge = knowledge_path.read_text(encoding="utf-8", errors="replace").strip()
+            # Filter to question-relevant sections to reduce noise in the agent prompt.
+            if model is not None and raw_knowledge:
+                knowledge_content = _extract_relevant_knowledge(question, raw_knowledge, model)
+            else:
+                knowledge_content = raw_knowledge
         except OSError:
             pass
 
@@ -681,7 +729,10 @@ def format_task_analysis_hint(analysis: dict) -> str:
 
     knowledge_content = analysis.get("knowledge_content", "")
     if knowledge_content:
-        lines.append(f"KNOWLEDGE.MD (full content — do not read this file again):\n{knowledge_content}")
+        lines.append(
+            f"KNOWLEDGE.MD (relevant excerpt — do not read this file again, "
+            f"irrelevant sections have been filtered out):\n{knowledge_content}"
+        )
 
     for doc in analysis.get("doc_contents", []):
         lines.append(
