@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 import threading
+from datetime import datetime
 
 from data_agent_baseline.agents.model import ModelAdapter
 from data_agent_baseline.agents.react import ReActAgent, ReActAgentConfig
@@ -64,6 +66,8 @@ Step 3 — Inspect schema and consider ALL data sources:
   relationships. ALL data sources are unified in one SQLite connection:
   - CSV and JSON files → accessible as plain table names (e.g. SELECT * FROM atom)
   - SQLite .db files   → accessible as <db_stem>.<table> (e.g. SELECT * FROM hero_power.hero_power)
+  - Large prose doc/*.md files → indexed as <filename_stem>_paragraphs(paragraph_idx INTEGER, content TEXT)
+    Use SQL LIKE to search them: SELECT content FROM <stem>_paragraphs WHERE content LIKE '%term%'
   You can JOIN across all sources in a single SQL query.
   CRITICAL: Do NOT run "SELECT name FROM sqlite_master WHERE type='table'" or any query
   against sqlite_master / sqlite_schema to discover tables. That system table only shows
@@ -72,6 +76,14 @@ Step 3 — Inspect schema and consider ALL data sources:
 
 Step 4 — Query and analyse:
   Use query_context_tables with SQL for all data retrieval.
+
+  Before writing any query involving age, duration, or 'current' date:
+    Call get_current_datetime to get today's date. Never assume or hardcode the current year.
+
+  For locating a specific term, threshold, or value in a large prose document:
+    Call search_doc with the exact keyword before reaching for execute_python.
+    search_doc returns all paragraphs containing the keyword — no code needed.
+
   Important SQL rules:
   - CSV columns are stored as TEXT — ALWAYS use CAST for numeric comparisons and arithmetic.
     WRONG: WHERE height_cm > 200          (text comparison: '61' > '200' is TRUE!)
@@ -136,6 +148,10 @@ Step 4 — Query and analyse:
       single task. Do NOT mix SQLite connections into the same Python step as file reading.
     - Keep printed output concise — print only the final structured result, not every
       intermediate line you inspect. Large raw text dumps will be truncated.
+    - Never use f-strings with {variable} expressions — they break JSON encoding.
+      Use string concatenation instead:
+        WRONG: print(f"Found {len(results)} rows")
+        RIGHT:  print("Found " + str(len(results)) + " rows")
 
 Step 5 — Validate before submitting:
   Before calling answer, verify:
@@ -187,11 +203,15 @@ def _read_doc(task: PublicTask, action_input: dict) -> ToolExecutionResult:
     path = str(action_input["path"])
     max_chars = int(action_input.get("max_chars", 8000))
     section = action_input.get("section")
+    # Agent may pass a focused query to override the default (task.question).
+    # A targeted single-concept query surfaces far more relevant chunks than
+    # the full question when the document is large.
+    query = str(action_input["query"]) if action_input.get("query") else task.question
     content = read_doc_preview(
         task,
         path,
         max_chars=max_chars,
-        query=task.question,
+        query=query,
         section=section,
     )
     return ToolExecutionResult(ok=True, content=content)
@@ -246,6 +266,7 @@ def _query_context_tables(task: PublicTask, action_input: dict) -> ToolExecution
 
 
 _EXECUTE_PYTHON_MAX_OUTPUT_CHARS = 3000
+_EXECUTE_PYTHON_MAX_OUTPUT_LINES = 60
 
 
 def _execute_python(task: PublicTask, action_input: dict) -> ToolExecutionResult:
@@ -256,18 +277,52 @@ def _execute_python(task: PublicTask, action_input: dict) -> ToolExecutionResult
         timeout_seconds=EXECUTE_PYTHON_TIMEOUT_SECONDS,
     )
     # Truncate large outputs before they enter the conversation history.
-    # Without this, a single execute_python call that returns thousands of
-    # characters of raw document text (e.g. medical lab reports) fills the
-    # context window and triggers content-filter rejections on every
-    # subsequent model call, crashing the remaining agent steps.
+    # Line-based truncation preserves complete lines (no mid-sentence cuts)
+    # and tells the agent the total scale so it knows how much was omitted.
     raw_output = content.get("output", "") or ""
     if len(raw_output) > _EXECUTE_PYTHON_MAX_OUTPUT_CHARS:
         content = dict(content)  # don't mutate the original
+        lines = raw_output.splitlines()
+        head = "\n".join(lines[:_EXECUTE_PYTHON_MAX_OUTPUT_LINES])
+        if len(head) > _EXECUTE_PYTHON_MAX_OUTPUT_CHARS:
+            head = head[:_EXECUTE_PYTHON_MAX_OUTPUT_CHARS]
         content["output"] = (
-            raw_output[:_EXECUTE_PYTHON_MAX_OUTPUT_CHARS]
-            + f"\n[output truncated — {len(raw_output)} chars total, showing first {_EXECUTE_PYTHON_MAX_OUTPUT_CHARS}]"
+            head
+            + "\n[truncated — "
+            + str(len(lines)) + " lines / " + str(len(raw_output)) + " chars total. "
+            "Print only your final structured result, not raw file content.]"
         )
     return ToolExecutionResult(ok=bool(content.get("success")), content=content)
+
+
+def _get_current_datetime(_: PublicTask, action_input: dict) -> ToolExecutionResult:
+    del action_input
+    now = datetime.now()
+    return ToolExecutionResult(ok=True, content={
+        "date": now.strftime("%Y-%m-%d"),
+        "year": now.year,
+        "month": now.month,
+        "day": now.day,
+    })
+
+
+def _search_doc(task: PublicTask, action_input: dict) -> ToolExecutionResult:
+    from data_agent_baseline.tools.filesystem import resolve_context_path
+    path = str(action_input["path"])
+    keyword = str(action_input["keyword"]).lower()
+    max_results = int(action_input.get("max_results", 10))
+
+    full_path = resolve_context_path(task, path)
+    text = full_path.read_text(encoding="utf-8", errors="replace")
+
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+    matches = [p for p in paragraphs if keyword in p.lower()]
+    return ToolExecutionResult(ok=True, content={
+        "keyword": keyword,
+        "total_matches": len(matches),
+        "showing": min(max_results, len(matches)),
+        "results": matches[:max_results],
+    })
 
 
 def _answer(_: PublicTask, action_input: dict) -> ToolExecutionResult:
@@ -302,15 +357,36 @@ _TOOL_SPECS: dict[str, ToolSpec] = {
         description="List all files and directories under the task context directory.",
         input_schema={"max_depth": 4},
     ),
+    "get_current_datetime": ToolSpec(
+        name="get_current_datetime",
+        description=(
+            "Return today's date and current year/month/day. "
+            "Call this before any query involving age, duration, or 'current' calculations. "
+            "Never assume or hardcode the current year."
+        ),
+        input_schema={},
+    ),
     "read_doc": ToolSpec(
         name="read_doc",
         description=(
             "Read a document from context. For knowledge.md, returns a table of contents "
             "on the first call; pass 'section' to read a specific ## header block. "
-            "For large doc/ files, returns the most query-relevant chunks automatically. "
+            "For large doc/ files, pass 'query' with a focused search term to surface the "
+            "most relevant chunks — use a short concept phrase, not the full question. "
+            "If no query is given, uses the task question for relevance ranking. "
             "Use execute_python for exhaustive extraction of all entities in large prose files."
         ),
-        input_schema={"path": "knowledge.md", "section": "## 2. Core Entities & Fields"},
+        input_schema={"path": "knowledge.md", "section": "## 2. Core Entities & Fields", "query": "optional focused search term"},
+    ),
+    "search_doc": ToolSpec(
+        name="search_doc",
+        description=(
+            "Keyword search inside any prose document in the context directory. "
+            "Returns all paragraphs that contain the keyword (case-insensitive). "
+            "Use this to locate specific terms, thresholds, or entity mentions in large "
+            "Markdown files without needing to write Python code."
+        ),
+        input_schema={"path": "doc/SomeFile.md", "keyword": "the term to find", "max_results": 10},
     ),
     "read_knowledge_section": ToolSpec(
         name="read_knowledge_section",
@@ -369,9 +445,11 @@ _TOOL_SPECS: dict[str, ToolSpec] = {
 }
 
 _TOOL_HANDLERS = {
+    "get_current_datetime": _get_current_datetime,
     "list_context": _list_context,
     "read_doc": _read_doc,
     "read_knowledge_section": _read_knowledge_section,
+    "search_doc": _search_doc,
     "show_context_schema": _show_context_schema,
     "query_context_tables": _query_context_tables,
     "execute_python": _execute_python,

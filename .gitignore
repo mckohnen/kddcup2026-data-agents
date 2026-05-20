@@ -22,6 +22,9 @@ htmlcov/
 .env.*.local
 .codex
 
+# Embedding model weights (downloaded by scripts/download_models.py)
+models/
+
 # Local data, docs, tests, and artifacts
 data/
 docs/

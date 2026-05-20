@@ -23,6 +23,11 @@ _DB_EXTENSIONS = ("*.db", "*.sqlite", "*.sqlite3")
 # reducing memory use and load time dramatically for wide tables.
 _LARGE_CSV_THRESHOLD_BYTES = 20 * 1024 * 1024  # 20 MB
 
+# Prose Markdown files in doc/ larger than this are indexed as paragraph tables
+# so the agent can query them with SQL LIKE expressions instead of reading raw text.
+_MD_PARAGRAPH_MIN_FILE_BYTES = 5_000   # skip tiny .md files
+_MD_PARAGRAPH_MIN_LENGTH = 80          # skip very short paragraphs (headers, captions)
+
 
 def _question_words(question: str) -> set[str]:
     """Extract lowercase, punctuation-stripped words from a question string."""
@@ -110,6 +115,40 @@ def _insert_rows(
     # CSV values arrive as strings and are stored as TEXT.
     rows = [[record.get(c) for c in columns] for record in records]
     conn.executemany(sql, rows)
+    conn.commit()
+
+
+def _md_table_name(path: Path) -> str:
+    """Derive a safe SQLite table name from a Markdown file path."""
+    stem = path.stem.lower()
+    stem = re.sub(r"[^a-z0-9]+", "_", stem).strip("_")
+    return stem + "_paragraphs"
+
+
+def _load_md_as_paragraphs(conn: sqlite3.Connection, path: Path) -> None:
+    """Index a prose Markdown file as a paragraph table in SQLite.
+
+    Creates table <stem>_paragraphs(paragraph_idx INTEGER, content TEXT).
+    The agent can then run SQL LIKE queries against prose content without
+    needing to write Python or use search_doc.  Only called for files that
+    exceed _MD_PARAGRAPH_MIN_FILE_BYTES.
+    """
+    text = path.read_text(encoding="utf-8", errors="replace")
+    paragraphs = [
+        p.strip() for p in re.split(r"\n{2,}", text)
+        if len(p.strip()) >= _MD_PARAGRAPH_MIN_LENGTH
+    ]
+    if not paragraphs:
+        return
+    table_name = _md_table_name(path)
+    conn.execute(
+        f'CREATE TABLE IF NOT EXISTS "{_sanitize(table_name)}" '
+        "(paragraph_idx INTEGER, content TEXT)"
+    )
+    conn.executemany(
+        f'INSERT INTO "{_sanitize(table_name)}" (paragraph_idx, content) VALUES (?, ?)',
+        enumerate(paragraphs),
+    )
     conn.commit()
 
 
@@ -205,6 +244,17 @@ def load_context_to_sqlite(
         except Exception:
             pass
 
+    # Index large prose doc/*.md files as paragraph tables for SQL LIKE queries.
+    # knowledge.md is excluded — it is navigated via read_knowledge_section instead.
+    doc_dir = context_dir / "doc"
+    if doc_dir.is_dir():
+        for md_file in sorted(doc_dir.rglob("*.md")):
+            try:
+                if md_file.stat().st_size >= _MD_PARAGRAPH_MIN_FILE_BYTES:
+                    _load_md_as_paragraphs(conn, md_file)
+            except Exception:
+                pass
+
     # ATTACH .db files — zero-copy, reads from disk on demand.
     aliases: list[str] = []
     used_aliases: set[str] = set()
@@ -283,6 +333,29 @@ def load_raw_tables(
                 raw.append({"table": csv_file.stem, "records": records_str})
         except Exception:
             pass
+
+    # Include large prose doc/*.md files as paragraph tables for the schema profiler.
+    doc_dir = context_dir / "doc"
+    if doc_dir.is_dir():
+        for md_file in sorted(doc_dir.rglob("*.md")):
+            try:
+                if md_file.stat().st_size >= _MD_PARAGRAPH_MIN_FILE_BYTES:
+                    text = md_file.read_text(encoding="utf-8", errors="replace")
+                    paragraphs = [
+                        p.strip() for p in re.split(r"\n{2,}", text)
+                        if len(p.strip()) >= _MD_PARAGRAPH_MIN_LENGTH
+                    ]
+                    if paragraphs:
+                        capped = paragraphs[:max_rows] if max_rows is not None else paragraphs
+                        raw.append({
+                            "table": _md_table_name(md_file),
+                            "records": [
+                                {"paragraph_idx": i, "content": p}
+                                for i, p in enumerate(capped)
+                            ],
+                        })
+            except Exception:
+                pass
 
     for pattern in _DB_EXTENSIONS:
         for db_file in sorted(context_dir.rglob(pattern)):

@@ -64,10 +64,50 @@ def _load_single_json_object(text: str) -> dict[str, object]:
     return payload
 
 
+def _escape_literal_control_chars(text: str) -> str:
+    """Escape unescaped control characters inside JSON string values.
+
+    When a model emits multi-line Python code inside a JSON string without
+    properly escaping newlines, json.JSONDecoder.raw_decode() raises
+    JSONDecodeError before any other repair can run.  This pass walks the text
+    character-by-character and replaces bare \\n / \\r / \\t inside string
+    values with their JSON escape sequences so downstream repairs can proceed.
+    """
+    result: list[str] = []
+    in_string = False
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == "\\" and in_string:
+            # Already-escaped sequence — copy both chars verbatim.
+            result.append(c)
+            i += 1
+            if i < len(text):
+                result.append(text[i])
+            i += 1
+            continue
+        if c == '"':
+            in_string = not in_string
+            result.append(c)
+        elif in_string and c == "\n":
+            result.append("\\n")
+        elif in_string and c == "\r":
+            result.append("\\r")
+        elif in_string and c == "\t":
+            result.append("\\t")
+        else:
+            result.append(c)
+        i += 1
+    return "".join(result)
+
+
 def _try_repair_json(raw_response: str) -> str | None:
     """Attempt lightweight repair of common LLM JSON formatting errors.
 
-    Handles two frequent cases:
+    Handles three cases in order:
+    0. Literal control characters (bare newlines/tabs) inside string values —
+       happens when the model emits multi-line execute_python code without
+       escaping.  raw_decode() rejects these before any other repair runs.
     1. Trailing commas before } or ]  — e.g. {"a":1,}
     2. Trailing closing braces after a valid object  — e.g. {"a":1}}
        Some models (qwen3.5) emit an extra } after the JSON object when the
@@ -77,6 +117,12 @@ def _try_repair_json(raw_response: str) -> str | None:
     unrecoverable.
     """
     text = _strip_json_fence(raw_response)
+
+    # Repair 0: escape literal newlines/tabs inside JSON string values so that
+    # raw_decode() can at least parse the structure.  Without this, Repair 2
+    # (trailing-brace strip) never gets a chance to run because raw_decode()
+    # throws JSONDecodeError on the first unescaped newline it encounters.
+    text = _escape_literal_control_chars(text)
 
     # Repair 1: trailing commas before closing braces / brackets
     cleaned = re.sub(r",(\s*[}\]])", r"\1", text)
