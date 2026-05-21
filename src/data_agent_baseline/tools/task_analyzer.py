@@ -286,6 +286,75 @@ def _has_count_scope_question(question: str) -> bool:
     return has_count and has_scope
 
 
+def _detect_date_format_columns(context: dict) -> list[dict]:
+    """Detect columns that store dates/periods as all-numeric strings and infer their format.
+
+    Many datasets encode time periods as compact numeric strings:
+      YYYYMM      → 6 digits, e.g. '201208'  (year-month)
+      YYYYMMDD    → 8 digits, e.g. '20120815' (year-month-day)
+      YYYYDDD     → 7 digits, e.g. '2012227'  (year + day-of-year)
+      YYYY        → 4 digits, e.g. '2012'     (year only — too short, skip)
+
+    Returns list of dicts: {table, column, format, example, filter_note}
+    Only flags columns whose name suggests a date/period concept AND whose sample
+    values are all-numeric strings of a consistent length matching a known pattern.
+    Skips ID-like columns (they often happen to be 6-8 digit integers).
+    """
+    _DATE_NAME_TOKENS = frozenset({
+        "date", "month", "year", "period", "ym", "ymd", "yearmonth",
+        "yearmo", "dt", "time", "week", "quarter",
+    })
+    _FORMAT_MAP = {
+        6: ("YYYYMM", "e.g. '201208' = August 2012",
+            "Filter a specific month: WHERE {col} = '201208'  "
+            "or a year range: WHERE {col} LIKE '2012%'"),
+        7: ("YYYYDDD", "e.g. '2012227' = day 227 of 2012",
+            "Filter a year: WHERE {col} LIKE '2012%'"),
+        8: ("YYYYMMDD", "e.g. '20120815' = 15 Aug 2012",
+            "Filter a month: WHERE {col} LIKE '201208%'  "
+            "or a specific day: WHERE {col} = '20120815'"),
+    }
+
+    found: list[dict] = []
+    for table_name, table_info in context.get("tables", {}).items():
+        if table_name.endswith("_paragraphs") or table_name.endswith("_complete"):
+            continue
+        for col, col_info in table_info.get("columns", {}).items():
+            # Must look like a date/period by name
+            col_lower = col.lower()
+            name_tokens = set(re.split(r"[_\s]", col_lower)) | {col_lower}
+            if not (name_tokens & _DATE_NAME_TOKENS):
+                continue
+            # Skip obvious ID columns
+            if col_info.get("role") in ("primary_key", "foreign_key"):
+                continue
+            if col_info.get("id_like"):
+                continue
+            # Sample values must be all-numeric strings of a consistent length
+            samples = [str(v) for v in col_info.get("sample_values", []) if v is not None]
+            if not samples:
+                continue
+            numeric_samples = [s for s in samples if s.isdigit()]
+            if len(numeric_samples) < max(1, len(samples) // 2):
+                continue  # majority must be all-digits
+            lengths = {len(s) for s in numeric_samples}
+            if len(lengths) != 1:
+                continue  # inconsistent length — not a clean format
+            digit_len = lengths.pop()
+            if digit_len not in _FORMAT_MAP:
+                continue  # 4-digit (year-only) and others — skip
+            fmt, example, filter_note = _FORMAT_MAP[digit_len]
+            found.append({
+                "table": table_name,
+                "column": col,
+                "format": fmt,
+                "example": example,
+                "filter_note": filter_note.format(col=col),
+                "sample": numeric_samples[0],
+            })
+    return found
+
+
 def _detect_empty_string_columns(context: dict, context_dir: "Path") -> list[str]:
     """Return table.column names that have a significant proportion of empty strings.
 
@@ -1030,6 +1099,7 @@ def build_task_analysis(
         "time_columns": _detect_time_columns(context),
         "empty_string_columns": empty_string_columns,
         "numeric_text_columns": _detect_numeric_text_columns(context),
+        "date_format_columns": _detect_date_format_columns(context),
         "bidirectional_tables": _detect_bidirectional_tables(context, context_dir=context_dir),
     }
 
@@ -1241,6 +1311,16 @@ def format_task_analysis_hint(analysis: dict) -> str:
             "WRONG: WHERE col = (SELECT MAX(score) ...) — text vs text, still wrong. "
             "RIGHT: WHERE CAST(col AS INTEGER) = (SELECT MAX(CAST(score AS INTEGER)) ...)"
         )
+
+    date_cols = analysis.get("date_format_columns", [])
+    if date_cols:
+        for dc in date_cols[:4]:
+            lines.append(
+                f"DATE FORMAT: '{dc['table']}.{dc['column']}' stores dates as "
+                f"{dc['format']} numeric strings ({dc['example']}). "
+                f"{dc['filter_note']}. "
+                f"Do NOT use ISO formats (YYYY-MM-DD) or LIKE '%%-%%-%%' on this column."
+            )
 
     knowledge_toc = analysis.get("knowledge_toc", "")
     if knowledge_toc:

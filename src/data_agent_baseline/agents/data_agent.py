@@ -116,6 +116,12 @@ Step 4 — Query and analyse:
     SELECT MIN(col), MAX(col), AVG(col) on the actual data column.
   - If a table is referenced in documentation but missing from the schema ("no such table"),
     the data may live in a prose doc file — load it with execute_python instead.
+  - Numeric date/period columns (e.g. Date, YearMonth) may use compact formats:
+      YYYYMM (201208), YYYYMMDD (20120815), YYYYDDD (2012227).
+    Check sample_values in show_context_schema output to confirm the format before
+    filtering. The preflight hint will name any detected date-period columns.
+    When the question specifies a time period, apply the same date filter to
+    EVERY table in the query that has that date column — not just the primary fact table.
   - Compound string IDs (e.g. "entity_1", "entity_2", ..., "entity_10") sort
     lexicographically as text: "entity_10" < "entity_2". To retrieve the Nth item
     by natural numeric order, extract and cast the numeric suffix:
@@ -834,6 +840,37 @@ def _extract_domain_guidance(hint: str) -> str:
     return block.strip()
 
 
+def _extract_data_warnings(hint: str) -> str:
+    """Extract data-quality warnings from a preflight hint for carry-forward into resumption.
+
+    Pulls any lines that start with a known warning tag. These warnings name specific
+    columns and are critical for SQL correctness — a resumed agent that skips them
+    will silently produce wrong results (e.g. empty-string FG values treated as abnormal).
+
+    Tags extracted: EMPTY STRING WARNING, NUMERIC TEXT COLUMNS, DATE FORMAT, TIE HINT,
+    COUNT SCOPE HINT, BIDIRECTIONAL TABLE, DICT COLUMN RULE, TIME COLUMN RULE.
+    """
+    if not hint:
+        return ""
+    _WARNING_TAGS = (
+        "EMPTY STRING WARNING",
+        "NUMERIC TEXT COLUMNS",
+        "DATE FORMAT",
+        "TIE HINT",
+        "COUNT SCOPE HINT",
+        "BIDIRECTIONAL TABLE",
+        "DICT COLUMN RULE",
+        "TIME COLUMN RULE",
+    )
+    lines = hint.split("\n")
+    result: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if any(stripped.startswith(tag) for tag in _WARNING_TAGS):
+            result.append(stripped)
+    return "\n".join(result)
+
+
 def summarise_trace_for_resumption(trace_dict: dict, preflight_hint: str = "") -> str:
     """Convert a completed (but unanswered) agent trace into a compact summary.
 
@@ -1036,13 +1073,23 @@ def summarise_trace_for_resumption(trace_dict: dict, preflight_hint: str = "") -
             f"Avoid loading large raw patient records into context."
         )
 
-    # Preserve domain analysis guidance from the preflight so the next attempt
-    # uses the correct multi-condition SQL pattern (any-row vs same-row vs
-    # temporal-proximity) even when preflight is skipped on resumption.
+    # Preserve domain analysis guidance and data-quality warnings from the preflight.
+    # These are skipped on resumption attempts (preflight only runs once) but are
+    # critical for SQL correctness: empty-string filters, CAST requirements, date
+    # formats, and multi-condition logic must all be re-applied by the resumed agent.
     _hint_source = preflight_hint or trace_dict.get("preflight", {}).get("hint", "")
     domain_guidance = _extract_domain_guidance(_hint_source)
+    data_warnings = _extract_data_warnings(_hint_source)
+    preserved: list[str] = []
     if domain_guidance:
-        lines.insert(1, f"PRESERVED DOMAIN GUIDANCE (carry-forward from preflight):\n{domain_guidance}\n")
+        preserved.append(f"PRESERVED DOMAIN GUIDANCE (carry-forward from preflight):\n{domain_guidance}")
+    if data_warnings:
+        preserved.append(
+            "PRESERVED DATA WARNINGS (carry-forward from preflight — still apply to ALL SQL):\n"
+            + data_warnings
+        )
+    if preserved:
+        lines.insert(1, "\n\n".join(preserved) + "\n")
 
     lines.append(f"Blocking issue: {failure_reason}")
     lines.append(
