@@ -119,17 +119,21 @@ Step 4 — Query and analyse:
     issuing more searches — the tool already searches the docs first and falls
     back to domain knowledge in one step. This applies to clinical/lab ranges,
     business KPI thresholds, and any other "what counts as X" cutoff.
-    After receiving a range, verify units by running SELECT MIN(col), MAX(col),
+    The tool returns a structured dict: {normal_range: {lower, upper, units},
+    abnormal_condition, confidence, source, raw_extracted_text}. The
+    abnormal_condition field is a plain-English WHERE-clause description you
+    can translate directly into SQL — do NOT re-interpret the raw text.
+    After receiving the range, verify units by running SELECT MIN(col), MAX(col),
     AVG(col), and the empty/null count on the actual data column.
-  - Unit-mismatch resolution: when the reference range and the data range
-    don't line up cleanly, try standard unit conversions (mg/dL ↔ g/L,
-    cells/µL ↔ ×10⁹/L, etc.) first. If NO sensible unit conversion brings the
-    reference range inside the observed data range, the data IS in the standard
-    unit and ALL non-empty values fall outside the normal range — meaning every
-    measured patient is "abnormal" (this is medically realistic: many tests are
-    only ordered on clinical suspicion of abnormality, so the recorded values
-    are pre-selected for abnormality). In that case answer with the count of
-    non-empty rows that also satisfy the other filters.
+  - Unit-mismatch resolution: when normal_range and the data range don't line
+    up cleanly, try standard unit conversions (mg/dL ↔ g/L, cells/µL ↔ ×10⁹/L,
+    etc.) first. If NO sensible unit conversion brings normal_range inside the
+    observed data range, the data IS in the standard unit and ALL non-empty
+    values fall outside the normal range — meaning every measured patient is
+    "abnormal" (medically realistic: many tests are only ordered on clinical
+    suspicion of abnormality, so the recorded values are pre-selected for
+    abnormality). In that case answer with the count of non-empty rows that
+    also satisfy the other filters.
   - If a table is referenced in documentation but missing from the schema ("no such table"),
     the data may live in a prose doc file — load it with execute_python instead.
   - Numeric date/period columns (e.g. Date, YearMonth) may use compact formats:
@@ -629,6 +633,12 @@ _TOOL_SPECS: dict[str, ToolSpec] = {
             "If nothing found in docs, falls back to domain knowledge. "
             "Use this INSTEAD of making multiple search_doc calls for a threshold — "
             "it returns a definitive range in one step. "
+            "Returns a structured dict with keys: "
+            "normal_range = {lower, upper, units}, "
+            "abnormal_condition (a plain-English WHERE-clause-style description), "
+            "confidence ('high'|'medium'|'low'), "
+            "source ('context_documents'|'domain_knowledge'), "
+            "raw_extracted_text (the source snippet for verification). "
             "Always verify units against SELECT MIN(col), MAX(col) after receiving the range."
         ),
         input_schema={"column": "WBC", "question_context": "normal range for white blood cells"},
@@ -666,6 +676,79 @@ _DOMAIN_KNOWLEDGE_SYSTEM_PROMPT = (
     "cited clinical reference range. "
     "If you are uncertain, say so explicitly rather than guessing."
 )
+
+
+_STRUCTURED_RANGE_EXTRACTION_PROMPT = (
+    "You are a reference-range extractor.  Given some text describing thresholds, "
+    "normal ranges, or abnormality criteria for a measured value, return a single "
+    "JSON object with these fields and no other text:\n"
+    "  {\n"
+    '    "lower": <float | null>   // lower bound of the NORMAL range; null if only an upper bound is given\n'
+    '    "upper": <float | null>   // upper bound of the NORMAL range; null if only a lower bound is given\n'
+    '    "units": <string | null>  // units (e.g. "mg/dL", "x10^9/L", "%"). null if not stated\n'
+    '    "abnormal_condition": <string>  // a SHORT plain-English description of what counts as abnormal, e.g. "value > 1.2 mg/dL" or "value < 4.5 or value > 11.0 x10^9/L"\n'
+    '    "confidence": "high" | "medium" | "low"  // "high" if the text explicitly states the range; "medium" if it strongly implies; "low" if you are inferring\n'
+    "  }\n\n"
+    "Rules:\n"
+    "  - If the text gives BOTH bounds, fill both lower and upper.\n"
+    "  - If the text says \"above X is abnormal\", set upper=X and lower=null.\n"
+    "  - If the text says \"below X is abnormal\", set lower=X and upper=null.\n"
+    "  - If the text mentions multiple ranges (e.g. gender-specific), use the most "
+    "general or report both with abnormal_condition combining them.\n"
+    "  - Numeric values MUST be JSON numbers (not strings).\n"
+    "  - If you genuinely cannot extract a numeric range, return: "
+    '{"lower": null, "upper": null, "units": null, "abnormal_condition": "<plain text from source>", "confidence": "low"}\n'
+    "Output ONLY the JSON object."
+)
+
+
+def _extract_structured_range(
+    raw_text: str,
+    model: "ModelAdapter",
+    column: str,
+    question_context: str,
+) -> dict:
+    """Convert free-text range info into a structured dict.
+
+    Falls back to a minimal envelope when the LLM call or JSON parse fails,
+    so callers always get a dict (never raises).
+    """
+    import json as _json  # noqa: PLC0415
+    from data_agent_baseline.agents.model import ModelMessage  # noqa: PLC0415
+
+    user_msg = (
+        f"Measured value: '{column}' (context: {question_context})\n\n"
+        f"Source text:\n{raw_text}"
+    )
+    try:
+        raw = model.complete(
+            [
+                ModelMessage(role="system", content=_STRUCTURED_RANGE_EXTRACTION_PROMPT),
+                ModelMessage(role="user", content=user_msg),
+            ],
+            extra_body={"enable_thinking": False},
+        ).strip()
+        # Strip code fences if the model added them despite instructions.
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\n?", "", raw).rstrip("`").strip()
+        parsed = _json.loads(raw)
+        # Sanity-coerce types so the agent always sees a consistent shape.
+        return {
+            "lower": (None if parsed.get("lower") in (None, "") else float(parsed["lower"])),
+            "upper": (None if parsed.get("upper") in (None, "") else float(parsed["upper"])),
+            "units": parsed.get("units") or None,
+            "abnormal_condition": str(parsed.get("abnormal_condition") or "").strip()
+                                  or "see raw_extracted_text",
+            "confidence": str(parsed.get("confidence") or "low").lower(),
+        }
+    except Exception:
+        return {
+            "lower": None,
+            "upper": None,
+            "units": None,
+            "abnormal_condition": raw_text[:200].strip(),
+            "confidence": "low",
+        }
 
 
 def create_data_agent_tool_registry(
@@ -793,33 +876,32 @@ def create_data_agent_tool_registry(
 
                 if search_hits:
                     log_inner.info("  LOOKUP_RANGE found in docs for column=%r", column)
-                    prompt = (
-                        f"From the text below, extract the standard reference range for '{column}' "
-                        f"(context: {question_context}). "
-                        f"Return ONLY the range — e.g. '4.5–11.0 ×10⁹/L' or 'below 200 mg/dL'. "
-                        f"If multiple ranges exist, list all briefly.\n\n"
-                        + "\n\n".join(search_hits)
+                    raw_text = "\n\n".join(search_hits)
+                    structured = _extract_structured_range(
+                        raw_text, model, column, question_context,
                     )
-                    try:
-                        range_str = model.complete(
-                            [ModelMessage(role="user", content=prompt)],
-                            extra_body={"enable_thinking": False},
-                        ).strip()
-                        return ToolExecutionResult(ok=True, content={
-                            "column": column,
-                            "range": range_str,
-                            "source": "context_documents",
-                            "next_step": (
-                                "Verify units: run SELECT MIN(col), MAX(col), AVG(col), "
-                                "and the count of empty/null cells on the actual data column. "
-                                "If NO unit conversion makes the reference range overlap with "
-                                "the observed data range, the standard unit applies and ALL "
-                                "non-empty rows are abnormal (this happens when a test is "
-                                "ordered only on clinical suspicion of abnormality)."
-                            ),
-                        })
-                    except Exception:
-                        pass  # fall through to domain knowledge
+                    return ToolExecutionResult(ok=True, content={
+                        "column": column,
+                        "normal_range": {
+                            "lower": structured["lower"],
+                            "upper": structured["upper"],
+                            "units": structured["units"],
+                        },
+                        "abnormal_condition": structured["abnormal_condition"],
+                        "confidence": structured["confidence"],
+                        "source": "context_documents",
+                        "raw_extracted_text": raw_text[:600],
+                        "next_step": (
+                            "Use 'abnormal_condition' directly in your WHERE clause "
+                            "(remember to CAST text columns to REAL/INTEGER first). "
+                            "Verify units: run SELECT MIN(col), MAX(col), AVG(col), and "
+                            "the count of empty/null cells on the actual data column. "
+                            "If NO unit conversion makes the normal_range overlap with the "
+                            "observed data range, the standard unit applies and ALL "
+                            "non-empty rows are abnormal (medically: tests ordered only on "
+                            "clinical suspicion)."
+                        ),
+                    })
 
                 # --- Phase 2: domain knowledge fallback ---
                 log_inner.info("  LOOKUP_RANGE fallback to domain knowledge for column=%r", column)
@@ -832,19 +914,30 @@ def create_data_agent_tool_registry(
                         ModelMessage(role="system", content=_DOMAIN_KNOWLEDGE_SYSTEM_PROMPT),
                         ModelMessage(role="user", content=domain_q),
                     ], extra_body={"enable_thinking": False}).strip()
+                    structured = _extract_structured_range(
+                        range_str, model, column, question_context,
+                    )
                     return ToolExecutionResult(ok=True, content={
                         "column": column,
-                        "range": range_str,
+                        "normal_range": {
+                            "lower": structured["lower"],
+                            "upper": structured["upper"],
+                            "units": structured["units"],
+                        },
+                        "abnormal_condition": structured["abnormal_condition"],
+                        "confidence": structured["confidence"],
                         "source": "domain_knowledge",
+                        "raw_extracted_text": range_str[:600],
                         "next_step": (
-                            "IMPORTANT: verify units by running SELECT MIN(col), MAX(col), "
-                            "AVG(col), and the count of empty/null cells on the actual data "
-                            "column. Domain knowledge values may be in different units than "
-                            "the dataset (e.g. cells/µL vs ×10⁹/L, mg/dL vs g/L). "
-                            "If NO unit conversion makes the reference range overlap with the "
-                            "observed data range, the standard unit applies and ALL non-empty "
-                            "rows are abnormal (medically: tests ordered only on suspicion "
-                            "of abnormality)."
+                            "Use 'abnormal_condition' directly in your WHERE clause "
+                            "(remember to CAST text columns to REAL/INTEGER first). "
+                            "Verify units: run SELECT MIN(col), MAX(col), AVG(col), and "
+                            "the count of empty/null cells on the actual data column. "
+                            "Domain-knowledge values may be in different units than the "
+                            "dataset (e.g. cells/µL vs ×10⁹/L, mg/dL vs g/L). "
+                            "If NO unit conversion makes the normal_range overlap with the "
+                            "observed data range, the standard unit applies and ALL "
+                            "non-empty rows are abnormal."
                         ),
                     })
                 except Exception as exc:

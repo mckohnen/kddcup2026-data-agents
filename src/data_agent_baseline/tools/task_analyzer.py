@@ -1048,26 +1048,40 @@ def _apply_semantic_gate(
     analysis: dict[str, Any],
     model: "ModelAdapter | None",
 ) -> None:
-    """Apply the semantic relevance gate in-place to analysis['*_columns'] lists.
+    """Apply the semantic relevance gate in-place to column-PRIMING rule lists.
 
-    Mutates ``analysis`` so that the structurally-detected lists for column-anchored
-    conditional rules contain only the entries the LLM judged relevant.
+    Mutates ``analysis`` so that the structurally-detected lists for
+    column-PRIMING rules contain only the entries the LLM judged relevant.
 
-    Rules gated here:
-      - time_columns        (TIME COLUMN RULE)
-      - dict_columns        (DICT COLUMN RULE)
-      - numeric_text_columns (NUMERIC TEXT COLUMNS)
-      - date_format_columns  (DATE FORMAT — anchor is table.column)
-      - bidirectional_tables (BIDIRECTIONAL TABLE — anchor is table name)
+    A "column-priming" rule is one that explicitly tells the agent to USE the
+    named column in a specific way (e.g. TIME COLUMN RULE says "use this column
+    with this special sort expression"; BIDIRECTIONAL says "use this table with
+    GROUP BY col1").  Such rules SHIFT THE AGENT'S ATTENTION onto a column it
+    might not have considered — making them powerful when the column is
+    relevant and damaging when it isn't (see task_408 where the TIME COLUMN
+    RULE for fastestLapTime mis-anchored the agent away from total race time).
 
-    The structural ``empty_string_columns`` is NOT gated: it's a data-quality
-    warning that applies to all numeric aggregations, not column-specific.
+    Rules gated here (column-PRIMING):
+      - time_columns          (TIME COLUMN RULE: "sort col X with this expr")
+      - dict_columns          (DICT COLUMN RULE: "filter col X with LIKE '%True%'")
+      - bidirectional_tables  (BIDIRECTIONAL TABLE: "use GROUP BY col1 of table X")
+
+    Rules NOT gated here (correctness reminders — apply broadly):
+      - numeric_text_columns  ("if you aggregate ANY of these, CAST first")
+      - date_format_columns   ("if you filter by date, use this format")
+      - empty_string_columns  ("if you aggregate ANY numeric column, filter '' ")
+
+    The correctness-reminder rules don't point at a specific column to USE —
+    they say "for any column you happen to use, follow this CAST/filter rule".
+    Pruning them therefore removes context the agent legitimately needs (e.g.
+    join-chain navigation in task_25 where budget.amount, .remaining, .spent
+    are tangentially relevant), without protecting against any mis-priming.
     """
     if model is None:
         return  # no gate possible
 
     # Build the features list, tracking which slot each item came from so we
-    # can prune it back after gating.
+    # can prune it back after gating.  Only column-priming rules are added.
     features: list[dict] = []
     slots: list[tuple[str, int]] = []  # (analysis_key, original_index)
     next_id = 0
@@ -1075,7 +1089,6 @@ def _apply_semantic_gate(
     for key, items in (
         ("time_columns", analysis.get("time_columns") or []),
         ("dict_columns", analysis.get("dict_columns") or []),
-        ("numeric_text_columns", analysis.get("numeric_text_columns") or []),
     ):
         for orig_idx, col_ref in enumerate(items):
             features.append({
@@ -1084,18 +1097,6 @@ def _apply_semantic_gate(
             })
             slots.append((key, orig_idx))
             next_id += 1
-
-    for orig_idx, dc in enumerate(analysis.get("date_format_columns") or []):
-        col_ref = f"{dc.get('table')}.{dc.get('column')}"
-        features.append({
-            "id": next_id,
-            "description": (
-                f"column '{col_ref}' stores dates as {dc.get('format')} numeric "
-                f"strings (e.g. {dc.get('sample')})"
-            ),
-        })
-        slots.append(("date_format_columns", orig_idx))
-        next_id += 1
 
     for orig_idx, b in enumerate(analysis.get("bidirectional_tables") or []):
         features.append({
