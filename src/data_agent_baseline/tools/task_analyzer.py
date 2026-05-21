@@ -44,6 +44,56 @@ if TYPE_CHECKING:
 _FUZZY_MIN_RATIO: float = 0.5
 
 
+# ---------------------------------------------------------------------------
+# Conditional rule detection — drives targeted preflight hint injections
+# ---------------------------------------------------------------------------
+
+_RANKING_KEYWORDS: frozenset[str] = frozenset({
+    "highest", "lowest", "best", "worst", "maximum", "minimum",
+    "largest", "smallest", "most", "fewest", "top", "bottom",
+    "fastest", "slowest", "greatest", "least",
+})
+
+# Time values formatted as [M]M:SS[.mmm] — lap times, race times, durations.
+_TIME_RE = re.compile(r"^\d{1,2}:\d{2}([.,]\d+)?$")
+
+
+def _has_ranking_question(question: str) -> bool:
+    """Return True if the question contains a ranking or superlative keyword."""
+    words = set(re.findall(r"\b\w+\b", question.lower()))
+    return bool(words & _RANKING_KEYWORDS)
+
+
+def _detect_dict_columns(context: dict) -> list[str]:
+    """Return table.column names whose sample values look like Python dict strings."""
+    found: list[str] = []
+    for table, info in context.get("tables", {}).items():
+        for col, col_info in info.get("columns", {}).items():
+            samples = col_info.get("sample_values", [])
+            if any(
+                isinstance(s, str) and s.strip().startswith("{")
+                for s in samples
+                if s is not None
+            ):
+                found.append(f"{table}.{col}")
+    return found
+
+
+def _detect_time_columns(context: dict) -> list[str]:
+    """Return table.column names whose sample values look like MM:SS.mmm time strings."""
+    found: list[str] = []
+    for table, info in context.get("tables", {}).items():
+        for col, col_info in info.get("columns", {}).items():
+            samples = col_info.get("sample_values", [])
+            if any(
+                isinstance(s, str) and _TIME_RE.match(s.strip())
+                for s in samples
+                if s is not None and str(s).strip()
+            ):
+                found.append(f"{table}.{col}")
+    return found
+
+
 def _fuzzy_ratio(a: str, b: str) -> float:
     """Return SequenceMatcher similarity ratio between two strings (0–1)."""
     return SequenceMatcher(None, a.lower(), str(b).lower()).ratio()
@@ -735,6 +785,10 @@ def build_task_analysis(
         "extracted_tables": extracted_tables,
         "_schema_tables": schema_tables,
         "domain_guidance": domain_guidance,
+        # Conditional rule flags — drive targeted injections in format_task_analysis_hint
+        "has_ranking_question": _has_ranking_question(question),
+        "dict_columns": _detect_dict_columns(context),
+        "time_columns": _detect_time_columns(context),
     }
 
 
@@ -803,6 +857,43 @@ def format_task_analysis_hint(analysis: dict) -> str:
     m = analysis["metric"]
     if m["metric"] != "unknown":
         lines.append(f"Metric hint:        {m['metric'].upper()} ({m['aggregation']}) — verify in docs")
+
+    # Conditional rule injections — only present when the schema or question warrants them.
+    # These rules were removed from the static system prompt (too edge-case for all tasks)
+    # and are instead injected here so the model sees them only when relevant.
+    if analysis.get("has_ranking_question"):
+        lines.append(
+            "TIE RULE — MANDATORY: This question contains a ranking term "
+            "(highest/lowest/best/worst/most/fewest/etc.). "
+            "You MUST use WHERE col = (SELECT MAX/MIN(col) FROM ...) to capture ALL tied rows. "
+            "NEVER use ORDER BY ... LIMIT 1 — it silently drops tied results even for singular "
+            "phrasing ('the employee with the highest salary' may have multiple equals). "
+            "Pre-answer check: run SELECT COUNT(*) WHERE col = (SELECT MAX/MIN(col) FROM ...). "
+            "If count > 1, return all tied rows."
+        )
+
+    dict_cols = analysis.get("dict_columns", [])
+    if dict_cols:
+        col_list = ", ".join(dict_cols[:3]) + (" …" if len(dict_cols) > 3 else "")
+        lines.append(
+            f"DICT COLUMN RULE: Column(s) {col_list} store Python dict strings "
+            "(e.g. \"{'is_active': True, 'is_verified': False}\"). "
+            "These use Python capitalisation (True/False), NOT SQL/JSON booleans. "
+            "Filter with: col LIKE '%True%'  or  instr(col, 'True') > 0. "
+            "Never use col = 1, col = 'true', or JSON functions — they silently match nothing."
+        )
+
+    time_cols = analysis.get("time_columns", [])
+    if time_cols:
+        col_list = ", ".join(time_cols[:3]) + (" …" if len(time_cols) > 3 else "")
+        lines.append(
+            f"TIME COLUMN RULE: Column(s) {col_list} store time as TEXT (e.g. \"1:23.456\"). "
+            "TEXT ORDER BY is alphabetical — \"1:9\" > \"1:12\" as text! Two mandatory rules: "
+            "(1) Filter blanks first: WHERE col != '' AND col IS NOT NULL. "
+            "(2) Sort numerically: ORDER BY "
+            "(CAST(SUBSTR(col,1,INSTR(col,':')-1) AS INTEGER)*60 "
+            "+ CAST(SUBSTR(col,INSTR(col,':')+1) AS REAL)) ASC."
+        )
 
     # Domain expert guidance — injected prominently so the agent reads it before querying.
     # The multi_condition_logic classification is always shown (valuable signal for join strategy).
