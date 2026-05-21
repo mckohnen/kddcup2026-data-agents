@@ -355,6 +355,88 @@ def _detect_date_format_columns(context: dict) -> list[dict]:
     return found
 
 
+def _detect_duplicate_column_matches(
+    matched_terms: list[dict],
+    candidate_tables: list[str],
+    context: dict,
+) -> list[dict]:
+    """Find non-ID columns with the same name on multiple candidate tables.
+
+    Detection is broader than just matched_terms because question vocabulary
+    often differs from column names (e.g. "diagnosed with" vs `Diagnosis`).
+    Any column name that exists on 2+ tables the agent is likely to use —
+    where the tables differ meaningfully in null rate — is flagged so the
+    agent can pick the right source.
+
+    A table is "candidate" if it appears in ``candidate_tables`` (matched by
+    name in the question) OR if it appears in ``matched_terms`` via any
+    column.  ID-like / FK / PK columns are skipped — duplicates there are
+    expected and not actionable.
+
+    Returns a list of warning dicts:
+        {column_name, candidates: [{table, column, null_ratio, empty_ratio, row_count}, ...]}
+    """
+    # Union of tables referenced by candidate_tables and matched_terms.
+    relevant_tables: set[str] = set(candidate_tables or [])
+    for m in matched_terms:
+        t = m.get("matched_table")
+        if t:
+            relevant_tables.add(t)
+
+    if len(relevant_tables) < 2:
+        return []  # need at least 2 tables to have duplicates
+
+    # Build column-name → [(table, column)] map across all relevant tables.
+    by_name: dict[str, list[tuple[str, str]]] = {}
+    for tbl in relevant_tables:
+        tbl_info = context.get("tables", {}).get(tbl, {})
+        for col in tbl_info.get("columns", {}).keys():
+            by_name.setdefault(col.lower(), []).append((tbl, col))
+
+    warnings: list[dict] = []
+    for _col_norm, entries in by_name.items():
+        unique = list(dict.fromkeys(entries))
+        if len(unique) < 2:
+            continue
+
+        candidates: list[dict] = []
+        skip = False
+        for tbl, col in unique:
+            col_info = (
+                context.get("tables", {}).get(tbl, {})
+                .get("columns", {}).get(col, {})
+            )
+            # If any candidate is an ID-like / key column, skip the whole warning —
+            # FK chains aren't a disambiguation problem.
+            if col_info.get("id_like") or col_info.get("role") in (
+                "primary_key", "foreign_key",
+            ):
+                skip = True
+                break
+            candidates.append({
+                "table": tbl,
+                "column": col,
+                "null_ratio": col_info.get("null_ratio", 0.0),
+                "empty_ratio": col_info.get("empty_ratio", 0.0),
+                "row_count": (
+                    context.get("tables", {}).get(tbl, {}).get("row_count", 0)
+                ),
+            })
+
+        if skip or len(candidates) < 2:
+            continue
+        # Only warn when the candidates differ meaningfully on null rate
+        # (otherwise the agent has no useful signal to disambiguate them).
+        null_ratios = sorted({round(c["null_ratio"], 2) for c in candidates})
+        if len(null_ratios) < 2 or (max(null_ratios) - min(null_ratios) < 0.1):
+            continue
+        warnings.append({
+            "column_name": candidates[0]["column"],
+            "candidates": candidates,
+        })
+    return warnings
+
+
 def _detect_empty_string_columns(context: dict, context_dir: "Path") -> list[str]:
     """Return table.column names that have a significant proportion of empty strings.
 
@@ -860,6 +942,197 @@ _DOC_SCAN_SYSTEM_PROMPT = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Semantic relevance gate for conditional preflight rules
+# ---------------------------------------------------------------------------
+#
+# Several conditional rules (TIME COLUMN, DICT COLUMN, NUMERIC TEXT, DATE FORMAT,
+# BIDIRECTIONAL TABLE) fire whenever their structural pattern is detected in the
+# schema — regardless of whether the column they describe is actually needed to
+# answer the question.  This pollutes the preflight hint and primes the agent
+# toward irrelevant columns (e.g. TIME COLUMN highlighting `fastestLapTime` for
+# a "how much faster did the champion finish" question, where total race time
+# is the right metric, not fastest lap).
+#
+# The semantic gate is a single LLM call that takes the question and a list of
+# detected features, and returns YES/NO for each based on question relevance.
+# Falls back to "keep all" on any failure — never makes the hint worse than the
+# pre-gate baseline.
+
+_SEMANTIC_GATE_SYSTEM_PROMPT = (
+    "You are a relevance filter for data analysis hints.\n\n"
+    "Given a question and a list of data-schema features (each one a structural "
+    "property of a specific column or table), decide for each feature whether the "
+    "column/table it describes is likely to be USED while answering the question "
+    "— filtered, joined, aggregated, sorted, or returned as output.\n\n"
+    "A feature is RELEVANT if:\n"
+    "  • The question explicitly names the column/table or a synonym, OR\n"
+    "  • The question's metric/filter/output plausibly requires that column.\n\n"
+    "A feature is NOT RELEVANT if its column is unrelated to the question's "
+    "metric, filter, or output — even if the feature is structurally present in "
+    "the schema. When in doubt, err on the side of NOT RELEVANT for columns the "
+    "question never touches.\n\n"
+    "Reply with EXACTLY one line per feature in the format:\n"
+    "  <N>: YES\n"
+    "  <N>: NO\n"
+    "No explanations, no other text."
+)
+
+
+def _gate_conditional_features(
+    question: str,
+    features: list[dict],
+    model: "ModelAdapter | None",
+) -> set[int]:
+    """LLM gate: return indices of features that are RELEVANT to the question.
+
+    ``features`` is a list of dicts with keys:
+      - ``id``: an integer index (0-based)
+      - ``description``: a short single-sentence description for the LLM
+
+    Returns a set of indices to KEEP.  On any model failure or parse failure,
+    falls back to keeping all indices (fail-open semantics — the gate should
+    never make the hint worse than the pre-gate baseline).
+    """
+    if not features:
+        return set()
+    if model is None:
+        return {f["id"] for f in features}
+
+    from data_agent_baseline.agents.model import ModelMessage  # noqa: PLC0415
+
+    feature_lines = [f"{f['id'] + 1}. {f['description']}" for f in features]
+    user_prompt = (
+        f"Question: {question}\n\n"
+        f"Detected schema features ({len(features)}):\n"
+        + "\n".join(feature_lines)
+        + "\n\nFor each, is it RELEVANT to answering this question?"
+    )
+
+    try:
+        raw = model.complete(
+            [
+                ModelMessage(role="system", content=_SEMANTIC_GATE_SYSTEM_PROMPT),
+                ModelMessage(role="user", content=user_prompt),
+            ],
+            extra_body=_NO_THINK,
+        )
+    except Exception:
+        return {f["id"] for f in features}  # fail open
+
+    keep: set[int] = set()
+    pattern = re.compile(r"^\s*(\d+)\s*[:.)\-\]]?\s*(YES|NO)\b", re.IGNORECASE)
+    for line in raw.split("\n"):
+        m = pattern.match(line)
+        if not m:
+            continue
+        n, verdict = int(m.group(1)) - 1, m.group(2).upper()
+        if verdict == "YES" and 0 <= n < len(features):
+            keep.add(n)
+
+    # Parse failure (zero indices recognised but features were present) → fail open
+    if not keep and any(
+        re.search(r"^\s*\d+\s*[:.)\-\]]?\s*(YES|NO)", line, re.IGNORECASE)
+        for line in raw.split("\n")
+    ):
+        # We parsed at least one verdict, just all NO — that's a valid all-NO answer.
+        return set()
+    if not keep:
+        # No verdicts parsed at all — model output was malformed, fail open.
+        return {f["id"] for f in features}
+    return keep
+
+
+def _apply_semantic_gate(
+    question: str,
+    analysis: dict[str, Any],
+    model: "ModelAdapter | None",
+) -> None:
+    """Apply the semantic relevance gate in-place to analysis['*_columns'] lists.
+
+    Mutates ``analysis`` so that the structurally-detected lists for column-anchored
+    conditional rules contain only the entries the LLM judged relevant.
+
+    Rules gated here:
+      - time_columns        (TIME COLUMN RULE)
+      - dict_columns        (DICT COLUMN RULE)
+      - numeric_text_columns (NUMERIC TEXT COLUMNS)
+      - date_format_columns  (DATE FORMAT — anchor is table.column)
+      - bidirectional_tables (BIDIRECTIONAL TABLE — anchor is table name)
+
+    The structural ``empty_string_columns`` is NOT gated: it's a data-quality
+    warning that applies to all numeric aggregations, not column-specific.
+    """
+    if model is None:
+        return  # no gate possible
+
+    # Build the features list, tracking which slot each item came from so we
+    # can prune it back after gating.
+    features: list[dict] = []
+    slots: list[tuple[str, int]] = []  # (analysis_key, original_index)
+    next_id = 0
+
+    for key, items in (
+        ("time_columns", analysis.get("time_columns") or []),
+        ("dict_columns", analysis.get("dict_columns") or []),
+        ("numeric_text_columns", analysis.get("numeric_text_columns") or []),
+    ):
+        for orig_idx, col_ref in enumerate(items):
+            features.append({
+                "id": next_id,
+                "description": f"column '{col_ref}' (structural detection: {key})",
+            })
+            slots.append((key, orig_idx))
+            next_id += 1
+
+    for orig_idx, dc in enumerate(analysis.get("date_format_columns") or []):
+        col_ref = f"{dc.get('table')}.{dc.get('column')}"
+        features.append({
+            "id": next_id,
+            "description": (
+                f"column '{col_ref}' stores dates as {dc.get('format')} numeric "
+                f"strings (e.g. {dc.get('sample')})"
+            ),
+        })
+        slots.append(("date_format_columns", orig_idx))
+        next_id += 1
+
+    for orig_idx, b in enumerate(analysis.get("bidirectional_tables") or []):
+        features.append({
+            "id": next_id,
+            "description": (
+                f"table '{b.get('table')}' has two FK columns "
+                f"({b.get('col1')}, {b.get('col2')}) both referencing "
+                f"'{b.get('ref_table')}'"
+            ),
+        })
+        slots.append(("bidirectional_tables", orig_idx))
+        next_id += 1
+
+    if not features:
+        return
+
+    keep = _gate_conditional_features(question, features, model)
+
+    # Build the pruned lists by analysis key.
+    kept_by_key: dict[str, list[int]] = {}
+    for feat_id, (key, orig_idx) in enumerate(slots):
+        if feat_id in keep:
+            kept_by_key.setdefault(key, []).append(orig_idx)
+
+    # Replace each list with only its kept entries (preserving order).
+    for key in {s[0] for s in slots}:
+        original = analysis.get(key) or []
+        kept_indices = kept_by_key.get(key, [])
+        analysis[key] = [original[i] for i in kept_indices]
+        # Audit trail — useful for trace inspection.
+        analysis.setdefault("_semantic_gate", {})[key] = {
+            "original_count": len(original),
+            "kept_count": len(kept_indices),
+            "dropped": [original[i] for i in range(len(original)) if i not in kept_indices],
+        }
+
+
 def count_doc_files(context_dir: "Path") -> int:
     """Count the number of .md files in context_dir/doc/ excluding knowledge.md.
 
@@ -1077,7 +1350,7 @@ def build_task_analysis(
     # Detect columns with significant empty-string rates (distort numeric aggregations)
     empty_string_columns = _detect_empty_string_columns(context, context_dir)
 
-    return {
+    analysis: dict[str, Any] = {
         "question": question,
         "matched_terms": all_matches,
         "candidate_tables": candidate_tables,
@@ -1101,7 +1374,15 @@ def build_task_analysis(
         "numeric_text_columns": _detect_numeric_text_columns(context),
         "date_format_columns": _detect_date_format_columns(context),
         "bidirectional_tables": _detect_bidirectional_tables(context, context_dir=context_dir),
+        "duplicate_column_warnings": _detect_duplicate_column_matches(all_matches, candidate_tables, context),
     }
+
+    # Semantic relevance gate — prune column-anchored conditional rules to only
+    # those the LLM judges relevant to the question.  Mutates ``analysis``
+    # in-place; falls back to keeping all entries on model failure.
+    _apply_semantic_gate(question, analysis, model)
+
+    return analysis
 
 
 def format_task_analysis_hint(analysis: dict) -> str:
@@ -1287,6 +1568,34 @@ def format_task_analysis_hint(analysis: dict) -> str:
             f"in '{w['fact_table']}' are NOT in '{w['lookup_table']}'. "
             f"Check prose doc files for additional '{w['lookup_id_col']}' attribute data "
             f"and parse it to build a complete lookup before filtering."
+        )
+
+    # Same-named column matched on multiple tables — the agent needs the NULL
+    # rates to pick the right source.  Skipped silently when null rates are
+    # similar (no useful disambiguation signal).
+    for w in analysis.get("duplicate_column_warnings", []):
+        parts = [
+            f"{c['table']}.{c['column']} ({int(c['null_ratio'] * 100)}% null"
+            + (
+                f", {int(c['empty_ratio'] * 100)}% empty"
+                if c.get("empty_ratio", 0) > 0.05
+                else ""
+            )
+            + ")"
+            for c in w["candidates"]
+        ]
+        # Identify the most populated source (lowest null_ratio) — usually the
+        # preferred default for patient-level / entity-level attributes.
+        sorted_by_pop = sorted(w["candidates"], key=lambda c: c["null_ratio"])
+        most_populated = sorted_by_pop[0]
+        lines.append(
+            f"DUPLICATE COLUMN MATCH ('{w['column_name']}'): same column name matched on "
+            f"multiple tables → {', '.join(parts)}. "
+            f"For entity-level attributes (questions about \"the patient's X\", "
+            f"\"this driver's Y\") prefer the more populated source — typically "
+            f"{most_populated['table']}.{most_populated['column']} here. "
+            f"For per-event / per-visit attributes the sparser source may be intended "
+            f"— verify by inspecting both columns before committing."
         )
 
     empty_cols = analysis.get("empty_string_columns", [])

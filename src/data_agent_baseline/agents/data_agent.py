@@ -113,9 +113,23 @@ Step 4 — Query and analyse:
     it returns. Do not discard rows based on subjective reasoning.
   - For the 'type of X' questions: GROUP BY the short categorical type column (e.g.
     event.type, category), not a description or name field.
-  - For clinical or lab reference ranges: call lookup_reference_range in one step instead
-    of making multiple search_doc calls. After receiving a range, verify units by running
-    SELECT MIN(col), MAX(col), AVG(col) on the actual data column.
+  - For any threshold, cutoff, reference range, or "normal vs abnormal" comparison:
+    if 2 read_knowledge_section or search_doc calls fail to surface a definitive
+    value for the term, IMMEDIATELY call lookup_reference_range. Do NOT keep
+    issuing more searches — the tool already searches the docs first and falls
+    back to domain knowledge in one step. This applies to clinical/lab ranges,
+    business KPI thresholds, and any other "what counts as X" cutoff.
+    After receiving a range, verify units by running SELECT MIN(col), MAX(col),
+    AVG(col), and the empty/null count on the actual data column.
+  - Unit-mismatch resolution: when the reference range and the data range
+    don't line up cleanly, try standard unit conversions (mg/dL ↔ g/L,
+    cells/µL ↔ ×10⁹/L, etc.) first. If NO sensible unit conversion brings the
+    reference range inside the observed data range, the data IS in the standard
+    unit and ALL non-empty values fall outside the normal range — meaning every
+    measured patient is "abnormal" (this is medically realistic: many tests are
+    only ordered on clinical suspicion of abnormality, so the recorded values
+    are pre-selected for abnormality). In that case answer with the count of
+    non-empty rows that also satisfy the other filters.
   - If a table is referenced in documentation but missing from the schema ("no such table"),
     the data may live in a prose doc file — load it with execute_python instead.
   - Numeric date/period columns (e.g. Date, YearMonth) may use compact formats:
@@ -706,12 +720,15 @@ def create_data_agent_tool_registry(
                         "answer": answer.strip(),
                         "source": "model_training_knowledge",
                         "next_step": (
-                            "IMPORTANT: run SELECT MIN(col), MAX(col), AVG(col) on the actual "
-                            "data column to verify units match. Then apply the "
-                            "DISTRIBUTION-BASED ABNORMALITY RULE from your instructions: if ALL "
-                            "non-empty values fall entirely outside the reference range on one "
-                            "side, treat every non-empty value as abnormal and filter with "
-                            "WHERE col IS NOT NULL AND col != '' — do not keep searching."
+                            "IMPORTANT: run SELECT MIN(col), MAX(col), AVG(col), and the "
+                            "count of empty/null cells on the actual data column. "
+                            "Try standard unit conversions (mg/dL ↔ g/L, cells/µL ↔ ×10⁹/L, etc.) "
+                            "first. If NO unit conversion brings the reference range inside the "
+                            "observed data range, the standard unit applies and ALL non-empty "
+                            "rows are abnormal (medically: tests ordered only on suspicion of "
+                            "abnormality). Use WHERE col IS NOT NULL AND col != '' to count "
+                            "abnormal patients in that case — do not keep searching for a "
+                            "narrower threshold."
                         ),
                     },
                 )
@@ -724,13 +741,17 @@ def create_data_agent_tool_registry(
                 "Query the model's training knowledge about a factual domain question — "
                 "e.g. standard lab reference ranges, clinical thresholds, or well-known "
                 "constants that are not explicitly defined in the context files. "
-                "Use this ONLY after 5 or more searches of knowledge.md and doc/ files "
-                "have not yielded a definitive threshold or value. Do NOT use it as a "
-                "first resort — always check the context first. "
+                "Use this when 2 or more searches of knowledge.md / doc/ files have not "
+                "yielded a definitive threshold or value. Prefer lookup_reference_range "
+                "for lab/clinical range questions — it searches docs first then falls "
+                "back to domain knowledge in one step. "
                 "CRITICAL: after receiving the answer, immediately verify units by running "
                 "SELECT MIN(col), MAX(col), AVG(col) on the relevant data column. "
                 "General knowledge thresholds may be in different units than the dataset "
                 "(e.g. cells/µL vs ×10⁹/L, g/dL vs g/L). Scale to match the data before filtering. "
+                "If NO unit conversion brings the reference range inside the data range, the "
+                "standard unit applies and ALL non-empty rows are abnormal (medically: tests "
+                "ordered only on suspicion of abnormality). "
                 "The answer reflects general knowledge and may vary by population; treat it as "
                 "a starting point, not ground truth."
             ),
@@ -789,8 +810,12 @@ def create_data_agent_tool_registry(
                             "range": range_str,
                             "source": "context_documents",
                             "next_step": (
-                                "Verify units: run SELECT MIN(col), MAX(col), AVG(col) on the actual "
-                                "data column to confirm the range matches the dataset's scale."
+                                "Verify units: run SELECT MIN(col), MAX(col), AVG(col), "
+                                "and the count of empty/null cells on the actual data column. "
+                                "If NO unit conversion makes the reference range overlap with "
+                                "the observed data range, the standard unit applies and ALL "
+                                "non-empty rows are abnormal (this happens when a test is "
+                                "ordered only on clinical suspicion of abnormality)."
                             ),
                         })
                     except Exception:
@@ -812,9 +837,14 @@ def create_data_agent_tool_registry(
                         "range": range_str,
                         "source": "domain_knowledge",
                         "next_step": (
-                            "IMPORTANT: verify units by running SELECT MIN(col), MAX(col), AVG(col) "
-                            "on the actual data column before applying this threshold. "
-                            "Domain knowledge values may be in different units than the dataset."
+                            "IMPORTANT: verify units by running SELECT MIN(col), MAX(col), "
+                            "AVG(col), and the count of empty/null cells on the actual data "
+                            "column. Domain knowledge values may be in different units than "
+                            "the dataset (e.g. cells/µL vs ×10⁹/L, mg/dL vs g/L). "
+                            "If NO unit conversion makes the reference range overlap with the "
+                            "observed data range, the standard unit applies and ALL non-empty "
+                            "rows are abnormal (medically: tests ordered only on suspicion "
+                            "of abnormality)."
                         ),
                     })
                 except Exception as exc:

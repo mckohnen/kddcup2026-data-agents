@@ -95,9 +95,22 @@ def profile_table(table_name: str, records: list[dict]) -> dict[str, Any]:
         non_null = [normalize_null(v) for v in values if normalize_null(v) is not None]
         unique_values = list(dict.fromkeys(map(str, non_null)))
 
+        # Distinguish literal empty-string cells from true NULLs.  Both are
+        # treated as "null" by ``normalize_null``, but the agent needs to know
+        # specifically which rows would CAST to 0 in SQL (only "" does).
+        empty_count = sum(1 for v in values if v == "")
+        null_count_total = row_count - len(non_null)
+
         col_profile: dict[str, Any] = {
             "type": infer_type(values),
-            "null_count": row_count - len(non_null),
+            "null_count": null_count_total,
+            "empty_count": empty_count,
+            "null_ratio": (
+                round(null_count_total / row_count, 3) if row_count > 0 else 0.0
+            ),
+            "empty_ratio": (
+                round(empty_count / row_count, 3) if row_count > 0 else 0.0
+            ),
             "unique_count": len(set(map(str, non_null))),
             "sample_values": unique_values[:10],
         }
