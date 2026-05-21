@@ -1301,7 +1301,17 @@ def format_task_analysis_hint(analysis: dict) -> str:
             "WHERE col != '' AND col IS NOT NULL"
         )
 
-    numeric_text_cols = analysis.get("numeric_text_columns", [])
+    # Exclude date-format columns from NUMERIC TEXT COLUMNS — date columns are filtered by
+    # string equality (WHERE Date = '201208'), not by numeric CAST. Showing them here
+    # contradicts the DATE FORMAT hint and causes the agent to misapply CAST on date filters.
+    date_format_col_ids = {
+        f"{dc['table']}.{dc['column']}"
+        for dc in analysis.get("date_format_columns", [])
+    }
+    numeric_text_cols = [
+        c for c in analysis.get("numeric_text_columns", [])
+        if c not in date_format_col_ids
+    ]
     if numeric_text_cols:
         col_list = ", ".join(numeric_text_cols[:8]) + (" …" if len(numeric_text_cols) > 8 else "")
         lines.append(
