@@ -448,7 +448,12 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
             break
 
         is_filter_stop = "content_filter_triggered" in failure_reason
-        summary = summarise_trace_for_resumption(run_result)
+        # Pass the saved preflight hint so domain guidance is preserved across
+        # resumptions (the preflight was already popped from run_result at
+        # line 429, so it must be passed explicitly here).
+        summary = summarise_trace_for_resumption(
+            run_result, preflight_hint=preflight_result.get("hint", "")
+        )
         prior_summaries.append(summary)
 
         # Persist intermediate trace + summary for debugging.

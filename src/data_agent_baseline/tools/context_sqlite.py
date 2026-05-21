@@ -18,6 +18,12 @@ _db_aliases: dict[str, list[str]] = {}
 
 _DB_EXTENSIONS = ("*.db", "*.sqlite", "*.sqlite3")
 
+# When load_raw_tables reads rows from attached .db files for schema profiling,
+# cap the sample at this many rows. SQLite files have native type metadata, so
+# type inference only needs a small sample. This prevents large .db files (e.g.
+# cards.db with 70+ columns × 50,000 rows) from exhausting the preflight budget.
+_DB_PROFILING_SAMPLE_ROWS = 500
+
 # CSV files larger than this threshold get column-pruned before loading.
 # Only columns relevant to the question (plus all ID/key columns) are loaded,
 # reducing memory use and load time dramatically for wide tables.
@@ -367,9 +373,13 @@ def load_raw_tables(
                 ).fetchall()
                 alias = _safe_alias(db_file.stem)
                 for (table_name,) in db_tables:
-                    limit_clause = f" LIMIT {max_rows}" if max_rows is not None else ""
+                    # Use a small fixed sample for .db profiling — SQLite's native
+                    # schema metadata makes large samples unnecessary for type inference,
+                    # and large .db files (70+ cols × 50k rows) would exhaust the preflight
+                    # budget. The caller's max_rows applies to CSV/JSON; .db uses its own cap.
+                    db_sample = _DB_PROFILING_SAMPLE_ROWS
                     rows = db_conn.execute(
-                        f'SELECT * FROM "{_sanitize(table_name)}"{limit_clause}'
+                        f'SELECT * FROM "{_sanitize(table_name)}" LIMIT {db_sample}'
                     ).fetchall()
                     records_db: list[dict[str, Any]] = [dict(r) for r in rows]
                     if records_db:

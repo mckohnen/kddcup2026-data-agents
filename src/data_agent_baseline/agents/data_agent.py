@@ -55,9 +55,10 @@ Step 2 — Read documentation:
   - Example queries: replicate their logic, not just their structure.
   For large doc/ files, call read_doc with the task question as context — relevant sections
   will be surfaced automatically via relevance ranking.
-  Do NOT use execute_python to search for keywords or values inside prose documents.
-  Always try read_doc first; only escalate to execute_python for exhaustive entity
-  extraction (e.g. listing ALL entities of a type from a document).
+  For prose doc files: prefer SQL on _paragraphs tables (exact ID/keyword match) or
+  read_doc (semantic/contextual lookup) over execute_python for simple lookups.
+  Use execute_python for exhaustive entity extraction (e.g. listing ALL entities of a
+  type, parsing structured records from every paragraph of a document).
 
 Step 3 — Inspect schema and consider ALL data sources:
   Treat every file in the context as a potential data source. Never conclude "no data
@@ -77,6 +78,13 @@ Step 3 — Inspect schema and consider ALL data sources:
   - SQLite .db files   → accessible as <db_stem>.<table> (e.g. SELECT * FROM hero_power.hero_power)
   - Large prose doc/*.md files → indexed as <filename_stem>_paragraphs(paragraph_idx INTEGER, content TEXT)
     Use SQL LIKE to search them: SELECT content FROM <stem>_paragraphs WHERE content LIKE '%term%'
+    IMPORTANT: for exact ID/code lookups in prose docs, SQL on _paragraphs is more reliable
+    than read_doc (which uses semantic RAG and may return the wrong chunk). When you have a
+    specific identifier (e.g. a record ID like 'recTxecmwIhCdIKvl' or a budget code), do:
+      SELECT content FROM budget_paragraphs WHERE content LIKE '%recTxecmwIhCdIKvl%'
+    This returns every paragraph that mentions that exact ID — amounts, status, event links.
+    Chain lookups: find event ID → find paragraph with that event ID → extract linked record ID
+    → find financial paragraph for that record ID → extract amount.
   You can JOIN across all sources in a single SQL query.
 
   ALL-DOCS MODE: If show_context_schema reveals ONLY *_paragraphs tables (no CSV/JSON/DB
@@ -138,6 +146,11 @@ Step 4 — Query and analyse:
     RIGHT:  WHERE CAST(height_cm AS INTEGER) > 200
     This applies to every numeric filter or sort on CSV-sourced columns.
   - JSON columns preserve native types (integers stay integers — no CAST needed).
+  - Python dict-format columns: some columns store Python dict objects as text strings
+    (e.g., leadershipSkills = "{'commander': True, 'brawl': False}"). These use Python
+    boolean capitalization (True/False), NOT SQL/JSON (true/false/1/0). Query them with:
+      instr(col, 'True') > 0   or   col LIKE '%True%'
+    Never use col = 1, col = 'true', or JSON operators — they will silently match nothing.
   - When ordering by a numeric ID suffix (e.g. atom_id like 'TR001_12'), always sort
     numerically: ORDER BY CAST(SUBSTR(col, INSTR(col, '_') + 1) AS INTEGER)
   - Never add LIMIT to the final answer query — return all matching rows.
@@ -157,9 +170,13 @@ Step 4 — Query and analyse:
     If each row represents one month: SELECT AVG(value_col).
     If each row is a yearly total: SELECT AVG(yearly_col) / 12.
   - Empty strings in CSV columns: CAST('' AS REAL) = 0 in SQLite, which silently distorts
-    AVG and SUM. Always filter empty strings from numeric aggregations:
-    WRONG: AVG(CAST(col AS REAL))                    -- '' treated as 0
-    RIGHT:  AVG(CASE WHEN col != '' THEN CAST(col AS REAL) END)
+    AVG, SUM, MIN, and MAX. ALWAYS filter empty strings AND NULLs from numeric aggregations
+    unless the question or documentation explicitly says to include them:
+    WRONG: AVG(CAST(col AS REAL))                       -- '' treated as 0
+    WRONG: MIN(col)                                     -- '' sorts before all valid values!
+    RIGHT:  AVG(CASE WHEN col != '' AND col IS NOT NULL THEN CAST(col AS REAL) END)
+    RIGHT:  MIN(CASE WHEN col != '' AND col IS NOT NULL THEN CAST(col AS REAL) END)
+    RIGHT:  MAX(CASE WHEN col != '' AND col IS NOT NULL THEN CAST(col AS REAL) END)
     Whether to also exclude 0-valued rows depends on domain context — do not assume 0
     means "unknown" unless the question or documentation says so.
   - Time strings (e.g. "1:23.456", "0:47.832") are stored as TEXT. TEXT ORDER BY is
@@ -189,13 +206,6 @@ Step 4 — Query and analyse:
     threshold or unit conversion. Instead, treat every non-empty value as abnormal and
     filter with WHERE col IS NOT NULL AND col != ''. Do not waste further steps on this.
 
-    COMMIT RULE: If after 10 steps total you still do not have an answer, stop searching
-    and commit to your best estimate. An imperfect answer always scores better than no answer
-    (no answer = 0 score). Use whatever evidence you have: domain knowledge thresholds,
-    partial data ranges, or the most defensible assumption. Submit an answer even if uncertain.
-    If you know the upper limit but not the lower limit of a normal range, use just the upper
-    limit (e.g. creatinine > 1.2 mg/dL = abnormal) — partial criteria beat no answer.
-
   For exhaustive entity extraction from prose documents (ALL-DOCS MODE or when the
   preflight extracted table is missing), use execute_python:
     - Open the file by path under the context directory.
@@ -205,10 +215,6 @@ Step 4 — Query and analyse:
       single task. Do NOT mix SQLite connections into the same Python step as file reading.
     - Keep printed output concise — print only the final structured result, not every
       intermediate line you inspect. Large raw text dumps will be truncated.
-    - Never use f-strings with {variable} expressions — they break JSON encoding.
-      Use string concatenation instead:
-        WRONG: print(f"Found {len(results)} rows")
-        RIGHT:  print("Found " + str(len(results)) + " rows")
 
 Step 5 — Validate before submitting:
   Before calling answer, verify:
@@ -221,8 +227,9 @@ Step 5 — Validate before submitting:
      column (the natural key or ID column) that identifies each X.
      Do NOT add supplementary columns (amounts, dates, counts, descriptions, status) unless
      the question explicitly asks for those attributes too.
-     EXCEPTION: "what is the [content]" questions (e.g. "what is the comment/message/text/
-     description/title") ask for the content itself, not an ID. Return the content column.
+     CONTENT COLUMN RULE: "what is the [comment/text/message/title/description/body/content]"
+     asks for the actual text content — return the text column, NOT the ID/uuid column.
+     "What is the name of X" → return the name column, NOT the id column.
   3. Column names come directly from the source data. Never invent aliases or rename columns.
   4. Result shape matches the question's intent:
      - "how many" → 1 row, 1 column (a single count).
@@ -231,8 +238,16 @@ Step 5 — Validate before submitting:
        never add a count/frequency column alongside them unless the question explicitly
        uses words like "count", "how many", "how often", "number of", or "frequency".
      - "list [entities]" → one row per unique entity, not one row per relationship record.
-     - "which/what X has the highest/lowest/maximum/minimum Y" → use WHERE Y = (SELECT
-       MAX/MIN(Y) ...) to capture ALL tied rows, not ORDER BY ... LIMIT 1.
+     - TIE RULE — MANDATORY for any ranking question: if the question contains words like
+       "highest / lowest / best / worst / maximum / minimum / largest / smallest / most /
+       fewest / top / bottom" — even if phrased in the singular ("what is the name of the
+       student with the best score?") — you MUST use WHERE col = (SELECT MAX/MIN(col) ...)
+       to capture ALL tied rows. NEVER use ORDER BY ... LIMIT 1 for these questions.
+       If rows are tied then multiple results are possible, despite singular phrasing in the question; a single row from LIMIT 1 may silently
+       drop valid results.
+       MANDATORY pre-answer check: after writing your query, explicitly verify there are no
+       ties by running: SELECT COUNT(*) FROM ... WHERE col = (SELECT MIN/MAX(col) FROM ...).
+       If count > 1, return all tied rows.
 
 Step 6 — Submit:
   Call answer with the final result table.
@@ -908,7 +923,23 @@ def create_data_agent_tool_registry(
 # Prior-attempt summarisation helpers (used for resumption after max_steps)
 # ---------------------------------------------------------------------------
 
-def summarise_trace_for_resumption(trace_dict: dict) -> str:
+def _extract_domain_guidance(hint: str) -> str:
+    """Extract the DOMAIN ANALYSIS GUIDANCE block from a preflight hint string."""
+    if not hint:
+        return ""
+    idx = hint.find("DOMAIN ANALYSIS GUIDANCE")
+    if idx == -1:
+        return ""
+    # Include up to the next blank-line-separated section (or end of string)
+    block = hint[idx:]
+    # Trim at the next double-newline that starts a new all-caps section header
+    m = re.search(r"\n\n[A-Z][A-Z ]", block)
+    if m:
+        block = block[: m.start()]
+    return block.strip()
+
+
+def summarise_trace_for_resumption(trace_dict: dict, preflight_hint: str = "") -> str:
     """Convert a completed (but unanswered) agent trace into a compact summary.
 
     The summary is injected as context into the next attempt so the agent can
@@ -1109,6 +1140,14 @@ def summarise_trace_for_resumption(trace_dict: dict) -> str:
             f"or use SQL to aggregate/filter before reading raw data. "
             f"Avoid loading large raw patient records into context."
         )
+
+    # Preserve domain analysis guidance from the preflight so the next attempt
+    # uses the correct multi-condition SQL pattern (any-row vs same-row vs
+    # temporal-proximity) even when preflight is skipped on resumption.
+    _hint_source = preflight_hint or trace_dict.get("preflight", {}).get("hint", "")
+    domain_guidance = _extract_domain_guidance(_hint_source)
+    if domain_guidance:
+        lines.insert(1, f"PRESERVED DOMAIN GUIDANCE (carry-forward from preflight):\n{domain_guidance}\n")
 
     lines.append(f"Blocking issue: {failure_reason}")
     lines.append(

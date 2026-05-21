@@ -759,7 +759,7 @@ def format_task_analysis_hint(analysis: dict) -> str:
             f"Schema already profiled ({len(schema_tables)} table(s): "
             + ", ".join(schema_tables[:6])
             + (f" … +{len(schema_tables) - 6} more" if len(schema_tables) > 6 else "")
-            + "). Do NOT call show_context_schema at step 1 — go directly to data work."
+            + "). Call show_context_schema if you need column-level detail."
         )
 
     if analysis["candidate_tables"]:
@@ -805,16 +805,23 @@ def format_task_analysis_hint(analysis: dict) -> str:
         lines.append(f"Metric hint:        {m['metric'].upper()} ({m['aggregation']}) — verify in docs")
 
     # Domain expert guidance — injected prominently so the agent reads it before querying.
+    # The multi_condition_logic classification is always shown (valuable signal for join strategy).
+    # Prescriptive guidance bullets are only shown for non-trivial multi-condition logic
+    # (temporal-proximity, any-row, unclear) where they provide genuine value. For same-row
+    # tasks the bullets tend to prescribe wrong formulas/interpretations, so we suppress them.
     dg = analysis.get("domain_guidance", {})
     if dg:
         role = dg.get("expert_role", dg.get("domain", "domain expert"))
         mc_logic = dg.get("multi_condition_logic", "")
         guidance_bullets = dg.get("guidance", [])
+        mc_logic_type = mc_logic.split("—")[0].strip().lower() if mc_logic else ""
+        show_bullets = mc_logic_type not in ("same-row", "")
         lines.append(f"\nDOMAIN ANALYSIS GUIDANCE (perspective: {role}):")
         if mc_logic:
             lines.append(f"  Multi-condition logic: {mc_logic}")
-        for bullet in guidance_bullets:
-            lines.append(f"  • {bullet}")
+        if show_bullets:
+            for bullet in guidance_bullets:
+                lines.append(f"  • {bullet}")
         lines.append("")  # blank line after block
 
     # Extracted tables: show prominently; suppress raw coverage warning for handled gaps.
