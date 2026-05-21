@@ -4,6 +4,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from data_agent_baseline.agents.model import ModelAdapter, ModelMessage, ModelStep
 from data_agent_baseline.task_logger import get_logger
@@ -275,6 +276,7 @@ class ReActAgent:
         enable_answer_critic: bool = True,
         task_hint: str | None = None,
         task_analysis: dict | None = None,
+        live_trace_path: Path | None = None,
     ) -> None:
         self.model = model
         self.tools = tools
@@ -285,6 +287,8 @@ class ReActAgent:
         self.task_hint = task_hint
         # Structured analysis dict passed to the critic for column disambiguation
         self.task_analysis = task_analysis or {}
+        # Optional path for incremental trace writes (enables post-mortem of timed-out runs)
+        self.live_trace_path = live_trace_path
 
     def _build_messages(self, task: PublicTask, state: AgentRuntimeState) -> list[ModelMessage]:
         system_content = build_system_prompt(
@@ -336,6 +340,24 @@ class ReActAgent:
                 )
         return messages
 
+    def _write_live_trace(self, task_id: str, state: AgentRuntimeState) -> None:
+        """Write a partial trace to disk after each step for post-mortem of timed-out runs."""
+        if self.live_trace_path is None:
+            return
+        try:
+            partial = AgentRunResult(
+                task_id=task_id,
+                answer=state.answer,
+                steps=list(state.steps),
+                failure_reason="(in progress)",
+            )
+            self.live_trace_path.write_text(
+                json.dumps(partial.to_dict(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
     def run(self, task: PublicTask) -> AgentRunResult:
         log = get_logger()
         state = AgentRuntimeState()
@@ -385,6 +407,7 @@ class ReActAgent:
                                 ok=False,
                             )
                         )
+                        self._write_live_trace(task.task_id, state)
                         continue
                 # -----------------------------------------------------------------
 
@@ -409,6 +432,7 @@ class ReActAgent:
                     ok=tool_result.ok,
                 )
                 state.steps.append(step_record)
+                self._write_live_trace(task.task_id, state)
                 if tool_result.is_terminal:
                     state.answer = tool_result.answer
                     log.info("DONE answer accepted at step %d", step_index)
@@ -459,6 +483,7 @@ class ReActAgent:
                             ok=tool_result.ok,
                         )
                         state.steps.append(step_record)
+                        self._write_live_trace(task.task_id, state)
                         if tool_result.is_terminal:
                             state.answer = tool_result.answer
                             log.info("DONE answer accepted at step %d (after repair)", step_index)
@@ -485,6 +510,7 @@ class ReActAgent:
                         ok=False,
                     )
                 )
+                self._write_live_trace(task.task_id, state)
 
         if state.answer is None and state.failure_reason is None:
             state.failure_reason = "Agent did not submit an answer within max_steps."

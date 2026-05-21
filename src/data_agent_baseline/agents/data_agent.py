@@ -106,9 +106,11 @@ Step 4 — Query and analyse:
   Before writing any query involving age, duration, or 'current' date:
     Call get_current_datetime to get today's date. Never assume or hardcode the current year.
 
-  For locating a specific term, threshold, or value in a large prose document:
-    Call search_doc with the exact keyword before reaching for execute_python.
-    search_doc returns all paragraphs containing the keyword — no code needed.
+  For locating a specific term, threshold, or value:
+    - Clinical/lab reference ranges (normal WBC, creatinine limit, etc.): call
+      lookup_reference_range FIRST — it searches docs and falls back to domain knowledge
+      automatically in ONE step. Do NOT call search_doc first for these.
+    - Other terms (entity names, categorical values, date ranges, codes): call search_doc.
     COMMIT-ON-FIRST-FIND: once an observation clearly states the threshold or range you
     need (e.g. "creatinine upper limit of normal is 1.2 mg/dL"), STOP searching. Do NOT
     call search_doc or read_doc again for the same fact. Proceed directly to execute_python
@@ -117,12 +119,20 @@ Step 4 — Query and analyse:
   Important SQL rules:
   - Multi-condition filtering on longitudinal data:
     Before writing any WHERE clause that combines two or more conditions on a
-    time-series table, read the
-    DOMAIN ANALYSIS GUIDANCE block in the preflight hint. That block tells you whether
-    the question calls for same-row (concurrent), any-row (independent), or temporal-
-    proximity logic — the right approach depends on domain and question phrasing.
-    Never combine independent conditions into a single WHERE clause without considering
-    whether the measurements must co-occur on the same date.
+    time-series table, read the DOMAIN ANALYSIS GUIDANCE block in the preflight hint.
+    That block tells you which logic to use:
+    • same-row: both conditions in one WHERE clause on the same table. Only use when
+      the columns are almost always populated together in the same row.
+    • any-row: use two separate subqueries joined on entity ID:
+        WHERE id IN (SELECT id FROM t WHERE condA) AND id IN (SELECT id FROM t WHERE condB)
+    • temporal-proximity: self-join on entity ID + date window. Use when measurements
+      are sparse (often empty per row) and timing matters:
+        SELECT DISTINCT t1.id FROM t t1 JOIN t t2
+          ON t1.id = t2.id AND ABS(julianday(t1.Date) - julianday(t2.Date)) <= 7
+        WHERE [condA on t1] AND [condB on t2]
+      The window (days) depends on domain context — 7-30 days is typical for lab tests.
+      For wide tables with many empty measurement columns, prefer temporal-proximity or
+      any-row over same-row — same-row silently excludes patients measured on different dates.
   - CSV columns are stored as TEXT — ALWAYS use CAST for numeric comparisons and arithmetic.
     WRONG: WHERE height_cm > 200          (text comparison: '61' > '200' is TRUE!)
     RIGHT:  WHERE CAST(height_cm AS INTEGER) > 200
@@ -766,7 +776,7 @@ def create_data_agent_tool_registry(
                 answer = model.complete([
                     ModelMessage(role="system", content=_DOMAIN_KNOWLEDGE_SYSTEM_PROMPT),
                     ModelMessage(role="user", content=question),
-                ])
+                ], extra_body={"enable_thinking": False})
                 log.info("  DOMAIN_KNOWLEDGE answer=%r", answer[:120])
                 return ToolExecutionResult(
                     ok=True,
@@ -848,7 +858,10 @@ def create_data_agent_tool_registry(
                         + "\n\n".join(search_hits)
                     )
                     try:
-                        range_str = model.complete([ModelMessage(role="user", content=prompt)]).strip()
+                        range_str = model.complete(
+                            [ModelMessage(role="user", content=prompt)],
+                            extra_body={"enable_thinking": False},
+                        ).strip()
                         return ToolExecutionResult(ok=True, content={
                             "column": column,
                             "range": range_str,
@@ -871,7 +884,7 @@ def create_data_agent_tool_registry(
                     range_str = model.complete([
                         ModelMessage(role="system", content=_DOMAIN_KNOWLEDGE_SYSTEM_PROMPT),
                         ModelMessage(role="user", content=domain_q),
-                    ]).strip()
+                    ], extra_body={"enable_thinking": False}).strip()
                     return ToolExecutionResult(ok=True, content={
                         "column": column,
                         "range": range_str,
@@ -912,8 +925,12 @@ def summarise_trace_for_resumption(trace_dict: dict) -> str:
 
     # Collect confirmed tables (from show_context_schema observations)
     confirmed_tables: list[str] = []
-    # Collect productive SQL (queries that returned rows)
-    productive_sql: list[str] = []
+    # Collect productive SQL (queries that returned rows), with sample rows
+    productive_sql: list[dict] = []
+    # Collect productive Python outputs (non-empty stdout with actual data)
+    productive_python: list[dict] = []
+    # Collect key factual findings (reference ranges, domain knowledge, search hits)
+    key_findings: list[str] = []
     # Track search_doc calls that returned 0 results — agent must not repeat these
     exhausted_searches: list[str] = []
     # Collect the last N non-empty thoughts
@@ -938,9 +955,46 @@ def summarise_trace_for_resumption(trace_dict: dict) -> str:
         if action == "query_context_tables" and obs.get("ok"):
             sql = step.get("action_input", {}).get("sql", "")
             rows = content.get("rows", []) if isinstance(content, dict) else []
+            columns = content.get("columns", []) if isinstance(content, dict) else []
             if rows and sql:
-                row_count = len(rows)
-                productive_sql.append(f"  [{row_count} rows] {sql[:120].strip()}")
+                productive_sql.append({
+                    "sql": sql[:200].strip(),
+                    "row_count": len(rows),
+                    "columns": columns,
+                    "sample_rows": rows[:3],
+                })
+
+        if action == "execute_python" and obs.get("ok"):
+            output = content.get("output", "") if isinstance(content, dict) else ""
+            code = step.get("action_input", {}).get("code", "")
+            if output and len(output.strip()) > 20 and "[truncated" not in output[:30]:
+                productive_python.append({
+                    "code_preview": code[:300].strip(),
+                    "output_preview": output.strip()[:500],
+                })
+            elif output and len(output.strip()) > 20:
+                # Truncated output still has useful data up to the cut
+                productive_python.append({
+                    "code_preview": code[:300].strip(),
+                    "output_preview": output.strip()[:500],
+                })
+
+        if action == "lookup_reference_range" and obs.get("ok"):
+            col = step.get("action_input", {}).get("column", "")
+            range_str = content.get("range", "") if isinstance(content, dict) else ""
+            source = content.get("source", "") if isinstance(content, dict) else ""
+            if range_str:
+                key_findings.append(
+                    f"Reference range for '{col}': {range_str} (source: {source})"
+                )
+
+        if action in ("consult_domain_knowledge",) and obs.get("ok"):
+            answer_text = content.get("answer", "") if isinstance(content, dict) else ""
+            question_text = step.get("action_input", {}).get("question", "")
+            if answer_text:
+                key_findings.append(
+                    f"Domain knowledge — Q: {question_text[:80]} → {answer_text[:200]}"
+                )
 
         if action == "search_doc" and obs.get("ok"):
             total = content.get("total_matches", -1) if isinstance(content, dict) else -1
@@ -948,6 +1002,15 @@ def summarise_trace_for_resumption(trace_dict: dict) -> str:
                 keyword = step.get("action_input", {}).get("keyword", "")
                 file_path = step.get("action_input", {}).get("path", "")
                 exhausted_searches.append(f"  keyword='{keyword}' in {file_path}")
+            elif total > 0:
+                keyword = step.get("action_input", {}).get("keyword", "")
+                file_path = step.get("action_input", {}).get("path", "")
+                results = content.get("results", []) if isinstance(content, dict) else []
+                if results:
+                    key_findings.append(
+                        f"search_doc '{keyword}' in {file_path}: {total} hits. "
+                        f"First match: {str(results[0])[:200]}"
+                    )
 
         # Track large tool result observations (potential content-filter triggers)
         if obs.get("ok") and action not in ("show_context_schema",):
@@ -982,10 +1045,32 @@ def summarise_trace_for_resumption(trace_dict: dict) -> str:
     if confirmed_tables:
         lines.append(f"Confirmed tables in schema: {', '.join(confirmed_tables[:12])}")
 
+    # Key factual findings first — these are the most actionable carry-forwards
+    if key_findings:
+        lines.append(
+            "KEY FINDINGS from prior attempt — accept these as established facts, "
+            "do NOT re-search for them:"
+        )
+        for f in key_findings[-8:]:
+            lines.append(f"  • {f}")
+
+    if productive_python:
+        lines.append(
+            "Python executions that produced output — use these results directly, "
+            "do NOT re-run the same extraction:"
+        )
+        for p in productive_python[-3:]:
+            lines.append(f"  Code: {p['code_preview'][:150]}")
+            lines.append(f"  Output: {p['output_preview'][:400]}")
+
     if productive_sql:
-        lines.append("SQL queries that returned data (reuse these as a starting point):")
-        for s in productive_sql[-5:]:  # last 5 productive queries
-            lines.append(s)
+        lines.append("SQL queries that returned data — reuse or refine these, do NOT re-run identical queries:")
+        for s in productive_sql[-5:]:
+            cols = s["columns"]
+            sample = s["sample_rows"]
+            lines.append(f"  [{s['row_count']} rows] cols={cols} SQL={s['sql'][:120]}")
+            if sample:
+                lines.append(f"  Sample rows: {sample[:2]}")
 
     if exhausted_searches:
         lines.append(
@@ -999,7 +1084,7 @@ def summarise_trace_for_resumption(trace_dict: dict) -> str:
     if last_thoughts:
         lines.append("Last agent thoughts (context on what was being attempted):")
         for t in last_thoughts[-3:]:
-            lines.append(f"  - {t[:150]}")
+            lines.append(f"  - {t[:200]}")
 
     # Warn if repeated API errors occurred — the next attempt must avoid that approach
     if failed_actions:
@@ -1085,11 +1170,13 @@ class DataAgent:
         max_steps: int = 16,
         preflight_timeout_seconds: int = 30,
         cache_dir: "Path | None" = None,
+        live_trace_path: "Path | None" = None,
     ) -> None:
         self.model = model
         self.max_steps = max_steps
         self.preflight_timeout_seconds = preflight_timeout_seconds
         self._cache_dir = cache_dir
+        self._live_trace_path = live_trace_path
 
     def run(self, task: PublicTask, prior_attempts: list[str] | None = None):
         """Run the agent on a task.
@@ -1135,20 +1222,25 @@ class DataAgent:
         n_docs = count_doc_files(task.context_dir)
         n_batches = max(1, (n_docs + 1) // 2)
         # Extractor timeout is additive on top of the base preflight budget.
+        # On resumptions (preflight_timeout_seconds == 0) we skip preflight entirely,
+        # so do NOT add the extractor bonus — that would run a spurious 25s thread.
         dynamic_preflight_secs = (
             self.preflight_timeout_seconds
             + (n_batches - 1) * 30
-            + self._EXTRACTOR_TIMEOUT_SECONDS
+            + (self._EXTRACTOR_TIMEOUT_SECONDS if self.preflight_timeout_seconds > 0 else 0)
         )
-        log.info("PREFLIGHT start (budget=%ds, docs=%d, batches=%d)", dynamic_preflight_secs, n_docs, n_batches)
         _preflight_result: dict = {}
-        _t = threading.Thread(target=_run_preflight, daemon=True)
-        _t.start()
-        _t.join(timeout=dynamic_preflight_secs)
+        if dynamic_preflight_secs > 0:
+            log.info("PREFLIGHT start (budget=%ds, docs=%d, batches=%d)", dynamic_preflight_secs, n_docs, n_batches)
+            _t = threading.Thread(target=_run_preflight, daemon=True)
+            _t.start()
+            _t.join(timeout=dynamic_preflight_secs)
+        else:
+            log.info("PREFLIGHT skipped (resumption or zero budget)")
         task_hint = _preflight_result.get("hint")
         if task_hint:
             log.info("PREFLIGHT done: hint=%d chars", len(task_hint))
-        else:
+        elif dynamic_preflight_secs > 0:
             log.warning("PREFLIGHT timed out or produced no hint")
         # Store for the caller (runner.py saves this as preflight.json).
         self._last_preflight: dict = {
@@ -1211,5 +1303,6 @@ class DataAgent:
             system_prompt=DATA_AGENT_SYSTEM_PROMPT,
             task_hint=task_hint,
             task_analysis=task_analysis,
+            live_trace_path=self._live_trace_path,
         )
         return agent.run(task)

@@ -379,6 +379,10 @@ _KNOWLEDGE_EXTRACT_SYSTEM_PROMPT = (
 
 _KNOWLEDGE_MIN_CHARS_TO_FILTER = 600  # skip LLM call for short documents
 
+# Passed as extra_body to disable Qwen3 chain-of-thought for fast utility calls.
+# These calls need a short factual answer, not deep reasoning.
+_NO_THINK = {"enable_thinking": False}
+
 
 def _extract_relevant_knowledge(
     question: str,
@@ -399,7 +403,7 @@ def _extract_relevant_knowledge(
         result = model.complete([
             ModelMessage(role="system", content=_KNOWLEDGE_EXTRACT_SYSTEM_PROMPT),
             ModelMessage(role="user", content=prompt),
-        ]).strip()
+        ], extra_body=_NO_THINK).strip()
         if result and result.upper() != "NONE" and len(result) >= 50:
             return result
     except Exception:
@@ -409,32 +413,61 @@ def _extract_relevant_knowledge(
 
 _DOMAIN_EXPERT_SYSTEM_PROMPT = (
     "You are a senior domain expert analyst. "
-    "Given a data analysis question and information about the dataset, identify the domain "
+    "Given a data analysis question, dataset schema, and knowledge excerpt, identify the domain "
     "and provide specific, actionable analysis guidance from an expert's perspective.\n\n"
     "Focus especially on:\n"
-    "1. Multi-condition filtering on time-series/longitudinal data: does 'entity has condition A "
-    "AND condition B' mean both conditions must appear in the SAME ROW (concurrent/same-visit), "
-    "or can they appear in DIFFERENT ROWS (any independent record), or should they be "
-    "temporally proximate (within a reasonable window of each other)?\n"
+    "1. Multi-condition filtering on longitudinal data — choose ONE of:\n"
+    "   - same-row: ONLY valid when both conditions share a column in the SAME physical row "
+    "AND both are always measured together (e.g. a wide table where measurement columns are "
+    "rarely empty). If either value is frequently empty/null, same-row will silently exclude "
+    "most valid patients.\n"
+    "   - any-row: patient ever satisfies condition A (in any row) AND ever satisfies condition B "
+    "(in any row, even at different times). Use when the question asks about a patient's "
+    "historical status independent of timing.\n"
+    "   - temporal-proximity: condition A and condition B must occur within a reasonable time "
+    "window of each other. Use when (a) both are measurements in a longitudinal table, "
+    "(b) the values are measured on different visits (i.e. the relevant columns are often "
+    "empty/null in the same row), AND (c) timing matters clinically (e.g. 'had normal immun marker concentration "
+    "when dopamine levels were elevated'). Implement via a self-join on patient_id with a date "
+    "window condition.\n"
+    "   - unclear: if the question is genuinely ambiguous after reading the schema.\n"
     "2. Domain-specific definitions: what 'normal', 'active', 'current', or other qualitative "
     "terms mean in this context.\n"
     "3. Data structure pitfalls an analyst unfamiliar with this domain might miss.\n\n"
+    "CRITICAL table-structure check: look at the schema. If a wide table has many measurement "
+    "columns (lab values, scores, metrics) and sample rows show many empty/null cells, the "
+    "measurements are collected on different visits — same-row will silently miss most patients. "
+    "Choose temporal-proximity or any-row instead.\n\n"
     "Output ONLY a JSON object — no preamble, no explanation outside it:\n"
     "{\n"
     '  "domain": "<e.g. clinical/medical | financial/business | sports | manufacturing | general>",\n'
     '  "expert_role": "<e.g. clinical data analyst | financial controller | sports statistician>",\n'
-    '  "multi_condition_logic": "<same-row | any-row | temporal-proximity | unclear — ",'
-    " plus a one-sentence rationale>,\n"
+    '  "multi_condition_logic": "<same-row | any-row | temporal-proximity | unclear — '
+    'plus a one-sentence rationale>",\n'
     '  "guidance": ["<bullet 1>", "<bullet 2>", "<bullet 3>"]\n'
     "}\n\n"
     "Maximum 3 guidance bullets. Be concise and specific to this question."
 )
 
 
+def _format_schema_for_domain_expert(context: dict) -> str:
+    """Format table column names concisely for the domain expert prompt."""
+    lines = []
+    for table_name, table_info in context.get("tables", {}).items():
+        if table_name.endswith("_paragraphs") or table_name.endswith("_complete"):
+            continue
+        cols = list(table_info.get("columns", {}).keys())
+        row_count = table_info.get("row_count", "?")
+        col_str = ", ".join(cols[:20]) + (" …" if len(cols) > 20 else "")
+        lines.append(f"  {table_name} ({row_count} rows): {col_str}")
+    return "\n".join(lines) if lines else "(no structured tables)"
+
+
 def _get_domain_expert_guidance(
     question: str,
     knowledge_content: str,
     model: "ModelAdapter",
+    context: dict | None = None,
 ) -> dict:
     """Return domain-expert analysis guidance for the question.
 
@@ -445,13 +478,18 @@ def _get_domain_expert_guidance(
     from data_agent_baseline.agents.model import ModelMessage  # noqa: PLC0415
 
     context_block = knowledge_content[:2000] if knowledge_content else "(no knowledge document)"
-    prompt = f"Question: {question}\n\nDataset knowledge excerpt:\n{context_block}"
+    schema_block = _format_schema_for_domain_expert(context or {})
+    prompt = (
+        f"Question: {question}\n\n"
+        f"Table schemas:\n{schema_block}\n\n"
+        f"Dataset knowledge excerpt:\n{context_block}"
+    )
 
     try:
         raw = model.complete([
             ModelMessage(role="system", content=_DOMAIN_EXPERT_SYSTEM_PROMPT),
             ModelMessage(role="user", content=prompt),
-        ]).strip()
+        ], extra_body=_NO_THINK).strip()
         # Strip markdown code fences if present
         if raw.startswith("```"):
             raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
@@ -550,7 +588,7 @@ def _scan_doc_contents(context_dir: "Path", model: "ModelAdapter | None" = None)
             response = model.complete([
                 ModelMessage(role="system", content=_DOC_SCAN_SYSTEM_PROMPT),
                 ModelMessage(role="user", content=sections),
-            ]).strip()
+            ], extra_body=_NO_THINK).strip()
         except Exception:  # noqa: BLE001
             continue  # skip failed batch, try remaining ones
         all_results.extend(_parse_response(response))
@@ -636,7 +674,7 @@ def build_task_analysis(
     domain_guidance: dict = {}
     if model is not None and knowledge_content:
         try:
-            domain_guidance = _get_domain_expert_guidance(question, knowledge_content, model)
+            domain_guidance = _get_domain_expert_guidance(question, knowledge_content, model, context=context)
         except Exception:
             pass
 

@@ -26,7 +26,7 @@ class ModelStep:
 
 
 class ModelAdapter(Protocol):
-    def complete(self, messages: list[ModelMessage]) -> str:
+    def complete(self, messages: list[ModelMessage], *, extra_body: dict | None = None) -> str:
         raise NotImplementedError
 
 
@@ -71,7 +71,7 @@ class OpenAIModelAdapter:
             timeout=_REQUEST_TIMEOUT,
         )
 
-    def complete(self, messages: list[ModelMessage]) -> str:
+    def complete(self, messages: list[ModelMessage], *, extra_body: dict | None = None) -> str:
         if not self.api_key:
             raise RuntimeError("Missing model API key in config.agent.api_key.")
 
@@ -86,6 +86,7 @@ class OpenAIModelAdapter:
                     model=self.model,
                     messages=[{"role": m.role, "content": m.content} for m in messages],
                     temperature=self.temperature,
+                    extra_body=extra_body,
                 )
             except RateLimitError as exc:
                 last_exc = exc
@@ -164,8 +165,8 @@ class ScriptedModelAdapter:
     def __init__(self, responses: list[str]) -> None:
         self._responses = list(responses)
 
-    def complete(self, messages: list[ModelMessage]) -> str:
-        del messages
+    def complete(self, messages: list[ModelMessage], *, extra_body: dict | None = None) -> str:
+        del messages, extra_body
         if not self._responses:
             raise RuntimeError("No scripted model responses remaining.")
         return self._responses.pop(0)

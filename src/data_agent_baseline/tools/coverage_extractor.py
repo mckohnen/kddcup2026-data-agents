@@ -203,7 +203,7 @@ def _extract_from_doc(
         response = model.complete([
             ModelMessage(role="system", content=_EXTRACT_SYSTEM_PROMPT),
             ModelMessage(role="user", content=user_msg),
-        ]).strip()
+        ], extra_body={"enable_thinking": False}).strip()
     except Exception:
         return {}
 

@@ -210,6 +210,7 @@ def _run_one_attempt_core(
         max_steps=effective_max_steps,
         preflight_timeout_seconds=preflight_secs,
         cache_dir=cache_dir,
+        live_trace_path=cache_dir / "trace_live.json",
     )
 
     run_result = agent.run(task, prior_attempts=prior_summaries or []).to_dict()
@@ -609,8 +610,8 @@ def run_benchmark(
             task_artifacts = [artifact for artifact in indexed_artifacts if artifact is not None]
 
     # Second-chance pass: re-run any tasks that produced no answer (timed out or
-    # deadlocked). Run sequentially with the full multi-slot timeout budget so each
-    # gets a genuine clean attempt.
+    # deadlocked). Uses the same worker count as the first pass so retries run in
+    # parallel — sequential retries waste time when multiple tasks fail at once.
     failed_ids = [
         a.task_id for a in task_artifacts
         if not a.succeeded and a.prediction_csv_path is None
@@ -619,15 +620,35 @@ def run_benchmark(
         retry_artifacts: dict[str, TaskRunArtifacts] = {}
         for task_id in failed_ids:
             status_log.mark_retrying(task_id)
+
+        def _retry_one(task_id: str) -> TaskRunArtifacts:
             artifact = run_single_task(
                 task_id=task_id,
                 config=config,
                 run_output_dir=run_output_dir,
             )
             status_log.mark_done(task_id, artifact)
-            retry_artifacts[task_id] = artifact
-            if progress_callback is not None:
-                progress_callback(artifact)
+            return artifact
+
+        retry_workers = min(effective_workers, len(failed_ids))
+        if retry_workers <= 1:
+            for task_id in failed_ids:
+                artifact = _retry_one(task_id)
+                retry_artifacts[task_id] = artifact
+                if progress_callback is not None:
+                    progress_callback(artifact)
+        else:
+            with ThreadPoolExecutor(max_workers=retry_workers) as retry_executor:
+                retry_future_to_id = {
+                    retry_executor.submit(_retry_one, task_id): task_id
+                    for task_id in failed_ids
+                }
+                for future in as_completed(retry_future_to_id):
+                    artifact = future.result()
+                    retry_artifacts[artifact.task_id] = artifact
+                    if progress_callback is not None:
+                        progress_callback(artifact)
+
         # Merge: replace failed artifacts with retry results
         task_artifacts = [
             retry_artifacts.get(a.task_id, a) for a in task_artifacts
