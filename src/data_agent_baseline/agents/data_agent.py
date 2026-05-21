@@ -63,9 +63,11 @@ Step 2 — Read documentation:
       Process paragraph by paragraph; print only the final structured result, not raw text.
       After this step you will have a short list of matching IDs — switch to SQL for any
       further attribute lookups on those IDs (see "Exact identifier lookup" above).
-  • Regex exhaustion fallback: if 2 or more execute_python attempts return 0 useful results
-      on the same document, stop retrying regex. Instead, for each ID you need to look up,
-      run: SELECT content FROM <stem>_paragraphs WHERE content LIKE '%<id>%'
+  • Regex exhaustion fallback: after 2 execute_python attempts, if you do not yet have
+      COMPLETE results for ALL entities you need (even if some partial results were found),
+      STOP retrying regex. Partial output is the trigger — you do not need 0 results to switch.
+      Instead, for each specific ID you need, run:
+        SELECT content FROM <stem>_paragraphs WHERE content LIKE '%<id>%'
       Read the returned paragraph text directly — the AI can parse natural-language prose
       without regex. This always works when the ID appears literally in the text.
 
@@ -136,6 +138,10 @@ Step 5 — Validate before submitting:
      "List [X]" → return only the identifier or name column — no supplementary columns.
      "List X and Y" → exactly 2 columns. Never add extra columns not explicitly requested.
      "Tally" → return only the value column — never add a count/frequency column alongside.
+     "Give their X" / "return their X" / "show their X" / "what is their X" → return ONLY
+     column X. Do NOT add an ID, key, or name column alongside X for context — those were
+     not requested. If X is fully identified by a filter condition already in the WHERE clause,
+     the output need only contain the X values themselves.
   2. Text content: "what is the [comment / title / description / body / text / message / post]" →
      return the TEXT column itself, NOT an ID, uuid, or integer column.
      "What is the name of X" → return the name column, not the ID column.

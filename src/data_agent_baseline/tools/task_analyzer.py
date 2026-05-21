@@ -1295,7 +1295,9 @@ def format_task_analysis_hint(analysis: dict) -> str:
         lines.append(
             f"EMPTY STRING WARNING: Column(s) {col_list} contain empty strings ('') "
             "that CAST to 0 in SQL — this silently distorts AVG, SUM, MIN, MAX. "
-            "Always filter before numeric aggregation: "
+            "This pattern may affect ALL numeric columns in these tables — not just the "
+            "ones listed above. Apply the empty-string filter to EVERY numeric column you "
+            "aggregate, even those not listed here: "
             "WHERE col != '' AND col IS NOT NULL"
         )
 
@@ -1348,7 +1350,12 @@ def format_task_analysis_hint(analysis: dict) -> str:
             "SELECT content FROM <stem>_paragraphs WHERE content LIKE '%<id>%' — "
             "and read the returned paragraph text to extract remaining attributes. "
             "Do NOT keep re-scanning the whole file with regex once you have the IDs. "
-            "If 2+ regex attempts return 0 useful results, switch immediately to the SQL lookup."
+            "CRITICAL — regex exhaustion fallback: after 2 execute_python attempts, if you "
+            "do not yet have COMPLETE results for ALL entities you need (even if you have "
+            "partial results), STOP using regex immediately. Switch to targeted SQL for each "
+            "specific ID: SELECT content FROM <stem>_paragraphs WHERE content LIKE '%<id>%' "
+            "Partial or incomplete regex output is the trigger — you do NOT need 0 results "
+            "to switch. The AI can parse the returned paragraph text directly without regex."
         )
 
     return "\n".join(lines)
