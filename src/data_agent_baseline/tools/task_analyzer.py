@@ -99,6 +99,69 @@ def _fuzzy_ratio(a: str, b: str) -> float:
     return SequenceMatcher(None, a.lower(), str(b).lower()).ratio()
 
 
+def _extract_knowledge_toc(knowledge_content: str) -> str:
+    """Return markdown section headings from knowledge.md as a compact TOC string.
+
+    Only extracts lines that start with # (headings). Returns a comma-separated
+    list of heading titles (without # prefix) for injection into the preflight hint.
+    Falls back to first 200 chars of content if no headings found.
+    """
+    headings = []
+    for line in knowledge_content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            title = re.sub(r"^#+\s*", "", stripped).strip()
+            if title:
+                headings.append(title)
+    if headings:
+        return "; ".join(headings)
+    # No headings — return a short excerpt so agent knows something is there
+    return knowledge_content[:200].replace("\n", " ").strip()
+
+
+def _detect_empty_string_columns(context: dict, context_dir: "Path") -> list[str]:
+    """Return table.column names that have a significant proportion of empty strings.
+
+    Uses the SQLite context to count empty strings (not just NULLs). Only numeric
+    or unknown-type columns are checked, since those are the ones where CAST(''
+    AS REAL)=0 would distort AVG/SUM/MIN/MAX aggregations.
+    """
+    from data_agent_baseline.tools.context_sqlite import run_sql_on_context
+
+    found: list[str] = []
+    tables = context.get("tables", {})
+    for table_name, table_info in tables.items():
+        if table_name.endswith("_paragraphs") or table_name.endswith("_complete"):
+            continue
+        row_count = table_info.get("row_count", 0)
+        if row_count < 10:
+            continue
+        for col, col_info in table_info.get("columns", {}).items():
+            col_type = col_info.get("type", "")
+            if col_type not in ("number", "integer", "unknown", "string"):
+                continue
+            # Skip obvious ID or primary key columns
+            if col_info.get("role") in ("primary_key", "foreign_key"):
+                continue
+            if col_info.get("id_like"):
+                continue
+            try:
+                if "." in table_name:
+                    alias, tbl = table_name.split(".", 1)
+                    sql = f'SELECT COUNT(*) FROM "{alias}"."{tbl}" WHERE "{col}" = \'\''
+                else:
+                    sql = f'SELECT COUNT(*) FROM "{table_name}" WHERE "{col}" = \'\''
+                result = run_sql_on_context(context_dir, sql, limit=1)
+                empty_count = (result.get("rows") or [[0]])[0][0]
+                if isinstance(empty_count, int) and empty_count > 0:
+                    ratio = empty_count / row_count
+                    if ratio >= 0.05:  # ≥5% empty strings — warn
+                        found.append(f"{table_name}.{col}")
+            except Exception:
+                pass
+    return found
+
+
 # ---------------------------------------------------------------------------
 # Text normalisation helpers
 # ---------------------------------------------------------------------------
@@ -705,17 +768,18 @@ def build_task_analysis(
     doc_contents = _scan_doc_contents(context_dir, model=model)
 
     knowledge_content: str = ""
+    knowledge_toc: str = ""
     knowledge_path = context_dir / "knowledge.md"
     if not knowledge_path.exists():
         knowledge_path = context_dir / "doc" / "knowledge.md"
     if knowledge_path.exists():
         try:
             raw_knowledge = knowledge_path.read_text(encoding="utf-8", errors="replace").strip()
-            # Filter to question-relevant sections to reduce noise in the agent prompt.
-            if model is not None and raw_knowledge:
-                knowledge_content = _extract_relevant_knowledge(question, raw_knowledge, model)
-            else:
+            if raw_knowledge:
+                # Keep full content for domain expert LLM call (not injected raw into agent)
                 knowledge_content = raw_knowledge
+                # Extract TOC for lightweight injection — agent reads actual sections on demand
+                knowledge_toc = _extract_knowledge_toc(raw_knowledge)
         except OSError:
             pass
 
@@ -771,6 +835,9 @@ def build_task_analysis(
                     candidate_columns.append(f"{t2}.{c}")
         schema_tables = list(context.get("tables", {}).keys())
 
+    # Detect columns with significant empty-string rates (distort numeric aggregations)
+    empty_string_columns = _detect_empty_string_columns(context, context_dir)
+
     return {
         "question": question,
         "matched_terms": all_matches,
@@ -782,6 +849,7 @@ def build_task_analysis(
         "coverage_warnings": coverage_warnings,
         "doc_contents": doc_contents,
         "knowledge_content": knowledge_content,
+        "knowledge_toc": knowledge_toc,
         "extracted_tables": extracted_tables,
         "_schema_tables": schema_tables,
         "domain_guidance": domain_guidance,
@@ -789,6 +857,7 @@ def build_task_analysis(
         "has_ranking_question": _has_ranking_question(question),
         "dict_columns": _detect_dict_columns(context),
         "time_columns": _detect_time_columns(context),
+        "empty_string_columns": empty_string_columns,
     }
 
 
@@ -939,11 +1008,22 @@ def format_task_analysis_hint(analysis: dict) -> str:
             f"and parse it to build a complete lookup before filtering."
         )
 
-    knowledge_content = analysis.get("knowledge_content", "")
-    if knowledge_content:
+    empty_cols = analysis.get("empty_string_columns", [])
+    if empty_cols:
+        col_list = ", ".join(empty_cols[:5]) + (" …" if len(empty_cols) > 5 else "")
         lines.append(
-            f"KNOWLEDGE.MD (relevant excerpt — do not read this file again, "
-            f"irrelevant sections have been filtered out):\n{knowledge_content}"
+            f"EMPTY STRING WARNING: Column(s) {col_list} contain empty strings ('') "
+            "that CAST to 0 in SQL — this silently distorts AVG, SUM, MIN, MAX. "
+            "Always filter before numeric aggregation: "
+            "WHERE col != '' AND col IS NOT NULL"
+        )
+
+    knowledge_toc = analysis.get("knowledge_toc", "")
+    if knowledge_toc:
+        lines.append(
+            f"KNOWLEDGE.MD EXISTS — sections: {knowledge_toc}. "
+            "You MUST call read_knowledge_section to read the relevant sections "
+            "BEFORE writing any SQL or Python. Do not skip this step."
         )
 
     for doc in analysis.get("doc_contents", []):
