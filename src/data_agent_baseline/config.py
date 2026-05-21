@@ -48,6 +48,11 @@ class RunConfig:
     # Keep agent.log even for tasks that produced a prediction.csv.
     # Useful during development; set to false for production runs to save disk space.
     keep_logs: bool = False
+    # Self-consistency voting: run each task N times in parallel and vote on the
+    # final prediction. Default 1 = no voting (current behaviour, identical layout).
+    # When > 1, each task gets N sub-runs under task_<id>/run_<i>/ and the voted
+    # winner is copied to task_<id>/prediction.csv for evaluation.
+    consistency_runs: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +110,7 @@ def load_app_config(config_path: Path) -> AppConfig:
         max_resumptions=int(run_payload.get("max_resumptions", run_defaults.max_resumptions)),
         task_timeout_seconds_per_attempt=per_attempt,
         keep_logs=bool(run_payload.get("keep_logs", run_defaults.keep_logs)),
+        consistency_runs=int(run_payload.get("consistency_runs", run_defaults.consistency_runs)),
     )
     env: dict[str, str] = {}
     for key, value in payload.get("env", {}).items():

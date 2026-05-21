@@ -18,9 +18,28 @@ from data_agent_baseline.agents.data_agent import DataAgent, summarise_trace_for
 from data_agent_baseline.agents.model import OpenAIModelAdapter
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.config import AppConfig
+from data_agent_baseline.run.voting import vote_on_answer
 from data_agent_baseline.task_logger import close_task_logger, setup_task_logger
 from data_agent_baseline.tools.input_detector import detect_input_files
 from data_agent_baseline.tools.registry import ToolRegistry, create_default_tool_registry
+
+
+def _task_output_subdir(
+    base_task_dir: Path, subrun_idx: int | None
+) -> Path:
+    """Return where a single agent run writes its outputs.
+
+    For consistency_runs=1 (subrun_idx=None): returns base_task_dir unchanged,
+    preserving the historical layout exactly.
+
+    For voting (subrun_idx=int): returns base_task_dir / f"run_{idx}", a
+    sub-directory so the N parallel sub-runs of the same task don't collide.
+    The voting layer copies the winning sub-run's prediction.csv up to
+    base_task_dir for the evaluator.
+    """
+    if subrun_idx is None:
+        return base_task_dir
+    return base_task_dir / f"run_{subrun_idx}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +204,7 @@ def _run_one_attempt_core(
     model=None,
     tools: ToolRegistry | None = None,
     override_max_steps: int | None = None,
+    subrun_idx: int | None = None,
 ) -> dict[str, Any]:
     """Run a SINGLE agent attempt (no internal resumption loop).
 
@@ -205,7 +225,11 @@ def _run_one_attempt_core(
     preflight_secs = config.run.preflight_timeout_seconds if is_first_attempt else 0
     effective_max_steps = override_max_steps if override_max_steps is not None else config.agent.max_steps
     # cache_dir stores extracted *_complete CSVs so resumptions can restore them.
-    cache_dir = Path(config.run.output_dir) / config.run.run_id / task_id
+    # When subrun_idx is set (consistency voting), each sub-run owns its own cache
+    # directory to avoid clobbering between concurrent N sub-runs of the same task.
+    cache_dir = _task_output_subdir(
+        Path(config.run.output_dir) / config.run.run_id / task_id, subrun_idx
+    )
     cache_dir.mkdir(parents=True, exist_ok=True)
     agent = DataAgent(
         model=model_instance,
@@ -254,6 +278,7 @@ def _run_single_task_core(
     config: AppConfig,
     model=None,
     tools: ToolRegistry | None = None,
+    subrun_idx: int | None = None,
 ) -> dict[str, Any]:
     """Run all attempts in-process (used when model/tools overrides are provided).
 
@@ -278,7 +303,9 @@ def _run_single_task_core(
     consecutive_filter_stops = 0
 
     while official_slot_idx < official_slot_count:
-        log_path = Path(str(config.run.output_dir)) / config.run.run_id / task_id / "agent.log"
+        log_path = _task_output_subdir(
+            Path(str(config.run.output_dir)) / config.run.run_id / task_id, subrun_idx
+        ) / "agent.log"
         setup_task_logger(log_path, attempt=total_attempt_idx + 1)
         run_result = _run_one_attempt_core(
             task_id=task_id,
@@ -288,6 +315,7 @@ def _run_single_task_core(
             model=model,
             tools=tools,
             override_max_steps=override_steps,
+            subrun_idx=subrun_idx,
         )
         cumulative_input += run_result.pop("input_tokens", 0)
         cumulative_output += run_result.pop("output_tokens", 0)
@@ -332,6 +360,7 @@ def _run_one_attempt_in_subprocess(
     queue: multiprocessing.Queue[Any],
     result_file: str,
     override_max_steps: int | None = None,
+    subrun_idx: int | None = None,
 ) -> None:
     """Run one attempt and write the result to *result_file* on disk.
 
@@ -339,7 +368,9 @@ def _run_one_attempt_in_subprocess(
     pipe-buffer limit that causes a deadlock when a large trace is put directly
     into a multiprocessing.Queue on macOS/Linux.
     """
-    log_path = Path(str(config.run.output_dir)) / config.run.run_id / task_id / "agent.log"
+    log_path = _task_output_subdir(
+        Path(str(config.run.output_dir)) / config.run.run_id / task_id, subrun_idx
+    ) / "agent.log"
     setup_task_logger(log_path, attempt=attempt_idx + 1)
     try:
         run_result = _run_one_attempt_core(
@@ -348,6 +379,7 @@ def _run_one_attempt_in_subprocess(
             prior_summaries=prior_summaries,
             is_first_attempt=(attempt_idx == 0),
             override_max_steps=override_max_steps,
+            subrun_idx=subrun_idx,
         )
         Path(result_file).write_text(
             json.dumps({"ok": True, "run_result": run_result}, ensure_ascii=False),
@@ -367,7 +399,12 @@ def _run_one_attempt_in_subprocess(
         close_task_logger()
 
 
-def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[str, Any]:
+def _run_single_task_with_timeout(
+    *,
+    task_id: str,
+    config: AppConfig,
+    subrun_idx: int | None = None,
+) -> dict[str, Any]:
     """Run a task with per-attempt wall-clock timeouts in separate subprocesses.
 
     The preflight budget is added on top of the first attempt's agent budget only.
@@ -418,7 +455,7 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
         queue: multiprocessing.Queue[Any] = ctx.Queue()
         process = ctx.Process(
             target=_run_one_attempt_in_subprocess,
-            args=(task_id, config, prior_summaries, total_attempt_idx, queue, result_file, override_max_steps),
+            args=(task_id, config, prior_summaries, total_attempt_idx, queue, result_file, override_max_steps, subrun_idx),
         )
         process.start()
         process.join(subprocess_budget)
@@ -494,7 +531,9 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
         prior_summaries.append(summary)
 
         # Persist intermediate trace + summary for debugging.
-        task_output_dir = Path(config.run.output_dir) / config.run.run_id / task_id
+        task_output_dir = _task_output_subdir(
+            Path(config.run.output_dir) / config.run.run_id / task_id, subrun_idx
+        )
         task_output_dir.mkdir(parents=True, exist_ok=True)
         _write_json(task_output_dir / f"trace_attempt_{total_attempt_idx + 1}.json", run_result)
         (task_output_dir / f"resumption_summary_{total_attempt_idx + 1}.txt").write_text(
@@ -521,8 +560,15 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
     return last_result
 
 
-def _write_task_outputs(task_id: str, run_output_dir: Path, run_result: dict[str, Any], *, keep_logs: bool = False) -> TaskRunArtifacts:
-    task_output_dir = run_output_dir / task_id
+def _write_task_outputs(
+    task_id: str,
+    run_output_dir: Path,
+    run_result: dict[str, Any],
+    *,
+    keep_logs: bool = False,
+    subrun_idx: int | None = None,
+) -> TaskRunArtifacts:
+    task_output_dir = _task_output_subdir(run_output_dir / task_id, subrun_idx)
     task_output_dir.mkdir(parents=True, exist_ok=True)
 
     # Save preflight analysis separately so it can be inspected independently.
@@ -566,21 +612,85 @@ def run_single_task(
     run_output_dir: Path,
     model=None,
     tools: ToolRegistry | None = None,
+    subrun_idx: int | None = None,
 ) -> TaskRunArtifacts:
     # Step 1: run input detection before the agent starts
     task = DABenchPublicDataset(config.dataset.root_path).get_task(task_id)
-    task_output_dir = run_output_dir / task_id
+    task_output_dir = _task_output_subdir(run_output_dir / task_id, subrun_idx)
     task_output_dir.mkdir(parents=True, exist_ok=True)
     input_files = detect_input_files(task)
     _write_json(task_output_dir / "input_detection.json", {"task_id": task_id, "input_files": input_files})
 
     started_at = perf_counter()
     if model is None and tools is None:
-        run_result = _run_single_task_with_timeout(task_id=task_id, config=config)
+        run_result = _run_single_task_with_timeout(
+            task_id=task_id, config=config, subrun_idx=subrun_idx,
+        )
     else:
-        run_result = _run_single_task_core(task_id=task_id, config=config, model=model, tools=tools)
+        run_result = _run_single_task_core(
+            task_id=task_id, config=config, model=model, tools=tools, subrun_idx=subrun_idx,
+        )
     run_result["e2e_elapsed_seconds"] = round(perf_counter() - started_at, 3)
-    return _write_task_outputs(task_id, run_output_dir, run_result, keep_logs=config.run.keep_logs)
+    return _write_task_outputs(
+        task_id, run_output_dir, run_result,
+        keep_logs=config.run.keep_logs,
+        subrun_idx=subrun_idx,
+    )
+
+
+def _aggregate_voting_artifact(
+    task_id: str,
+    run_output_dir: Path,
+    sub_artifacts: list[TaskRunArtifacts],
+    vote_summary: dict[str, Any],
+) -> TaskRunArtifacts:
+    """Build a single TaskRunArtifacts from N sub-run artifacts + a vote outcome.
+
+    The aggregated artifact points to the TOP-LEVEL prediction.csv (the voted
+    winner) and the TOP-LEVEL trace.json (a small voting-summary stub so the
+    evaluator and downstream tools still find a trace). Tokens are summed
+    across all sub-runs so cost reporting reflects the full vote.
+    """
+    base_task_dir = run_output_dir / task_id
+    final_pred = base_task_dir / "prediction.csv"
+    winner_idx = vote_summary.get("winner_subrun_idx", 0)
+    # Use winner's trace as the canonical trace path.
+    winner_artifact = next(
+        (a for a in sub_artifacts if a.task_output_dir.name == f"run_{winner_idx}"),
+        sub_artifacts[0] if sub_artifacts else None,
+    )
+    trace_path = (
+        winner_artifact.trace_path if winner_artifact is not None
+        else base_task_dir / "trace.json"
+    )
+
+    input_tokens = sum(a.input_tokens for a in sub_artifacts)
+    output_tokens = sum(a.output_tokens for a in sub_artifacts)
+
+    # Succeeded iff the chosen winner has a prediction.
+    succeeded = final_pred.exists()
+    # Compose a failure-reason string from sub-runs if no prediction was chosen.
+    failure_reason: str | None = None
+    if not succeeded:
+        sub_reasons = [
+            f"run_{a.task_output_dir.name.removeprefix('run_')}: {a.failure_reason}"
+            for a in sub_artifacts if a.failure_reason
+        ]
+        failure_reason = (
+            "; ".join(sub_reasons) if sub_reasons
+            else "No sub-run produced a prediction; vote could not select a winner."
+        )
+
+    return TaskRunArtifacts(
+        task_id=task_id,
+        task_output_dir=base_task_dir,
+        prediction_csv_path=final_pred if succeeded else None,
+        trace_path=trace_path,
+        succeeded=succeeded,
+        failure_reason=failure_reason,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
 
 
 def run_benchmark(
@@ -606,6 +716,12 @@ def run_benchmark(
 
     task_ids = [task.task_id for task in tasks]
 
+    # Self-consistency voting: if consistency_runs > 1, each task gets N independent
+    # sub-runs and the voted answer wins.  When 1, behaviour is byte-identical to
+    # the historical single-run path.
+    n_runs = max(1, getattr(config.run, "consistency_runs", 1))
+    voting_enabled = n_runs > 1
+
     status_log = TaskStatusLog(run_output_dir / "task_status.json", task_ids)
 
     def _run_and_update(task_id: str, *, shared_model=None, shared_tools=None) -> TaskRunArtifacts:
@@ -627,8 +743,76 @@ def run_benchmark(
         status_log.mark_done(task_id, artifact)
         return artifact
 
+    def _run_subrun(task_id: str, subrun_idx: int) -> TaskRunArtifacts:
+        """Single voting sub-run — no status_log touch (handled per-task)."""
+        return run_single_task(
+            task_id=task_id,
+            config=config,
+            run_output_dir=run_output_dir,
+            subrun_idx=subrun_idx,
+        )
+
     task_artifacts: list[TaskRunArtifacts]
-    if effective_workers == 1:
+
+    if voting_enabled:
+        # Build flat work units: (task_id, subrun_idx) for each task × each sub-run.
+        # Submit all to a single thread pool so total concurrency stays at max_workers.
+        work_units = [(tid, i) for tid in task_ids for i in range(n_runs)]
+        # Per-task accumulator + lock for thread-safe aggregation.
+        per_task_subruns: dict[str, list[TaskRunArtifacts | None]] = {
+            tid: [None] * n_runs for tid in task_ids
+        }
+        finished_tasks: dict[str, TaskRunArtifacts] = {}
+        finished_lock = threading.Lock()
+        # Build a lookup so we can pass the question to the LLM judge.
+        questions = {t.task_id: t.question for t in tasks}
+        # A shared model adapter for the judge to keep cost minimal.
+        judge_model = build_model_adapter(config)
+
+        for tid in task_ids:
+            status_log.mark_running(tid)
+
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            future_to_unit = {
+                executor.submit(_run_subrun, tid, idx): (tid, idx)
+                for tid, idx in work_units
+            }
+            for future in as_completed(future_to_unit):
+                tid, idx = future_to_unit[future]
+                sub_artifact = future.result()
+                with finished_lock:
+                    per_task_subruns[tid][idx] = sub_artifact
+                    completed_count = sum(
+                        1 for a in per_task_subruns[tid] if a is not None
+                    )
+                    if completed_count == n_runs:
+                        # All N sub-runs for this task are done → vote.
+                        sub_artifacts = [a for a in per_task_subruns[tid] if a is not None]
+                        try:
+                            vote_summary = vote_on_answer(
+                                task_id=tid,
+                                task_output_dir=run_output_dir / tid,
+                                question=questions.get(tid, ""),
+                                n_runs=n_runs,
+                                model=judge_model,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            vote_summary = {
+                                "task_id": tid,
+                                "n_runs": n_runs,
+                                "decision": "error",
+                                "winner_subrun_idx": 0,
+                                "error": str(exc),
+                            }
+                        task_artifact = _aggregate_voting_artifact(
+                            tid, run_output_dir, sub_artifacts, vote_summary,
+                        )
+                        finished_tasks[tid] = task_artifact
+                        status_log.mark_done(tid, task_artifact)
+                        if progress_callback is not None:
+                            progress_callback(task_artifact)
+        task_artifacts = [finished_tasks[tid] for tid in task_ids if tid in finished_tasks]
+    elif effective_workers == 1:
         shared_model = model or build_model_adapter(config)
         shared_tools = tools or create_default_tool_registry()
         task_artifacts = []
@@ -664,7 +848,13 @@ def run_benchmark(
             and "max_steps" not in reason
         )
 
-    failed_ids = [a.task_id for a in task_artifacts if _is_wall_clock_failure(a)]
+    # Skip the second-chance pass when voting is enabled — all N sub-runs already
+    # had their chance, and a single non-voting retry would overwrite the voted
+    # prediction.csv with a one-off attempt.
+    failed_ids = (
+        [] if voting_enabled
+        else [a.task_id for a in task_artifacts if _is_wall_clock_failure(a)]
+    )
     if failed_ids:
         retry_artifacts: dict[str, TaskRunArtifacts] = {}
         for task_id in failed_ids:
