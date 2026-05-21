@@ -1262,9 +1262,13 @@ def format_task_analysis_hint(analysis: dict) -> str:
         lines.append(
             "ALL-DOCS MODE: show_context_schema has ONLY *_paragraphs tables — "
             "ALL structured data is embedded in prose documents. "
-            "Use execute_python with regex to extract entity IDs and values from "
-            "the full doc files. Do NOT rely on search_doc for data extraction. "
-            "See ALL-DOCS MODE instructions in the system prompt."
+            "Two-phase strategy: "
+            "(1) Use execute_python with regex to extract the full list of matching entity IDs. "
+            "(2) Once you have a short list of specific IDs (≤~10), switch to targeted SQL — "
+            "SELECT content FROM <stem>_paragraphs WHERE content LIKE '%<id>%' — "
+            "and read the returned paragraph text to extract remaining attributes. "
+            "Do NOT keep re-scanning the whole file with regex once you have the IDs. "
+            "If 2+ regex attempts return 0 useful results, switch immediately to the SQL lookup."
         )
 
     return "\n".join(lines)

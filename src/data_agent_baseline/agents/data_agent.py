@@ -51,8 +51,9 @@ Step 2 — Read documentation:
   • Exact identifier lookup (you know a specific ID, code, or name):
       SQL on _paragraphs — SELECT content FROM <stem>_paragraphs WHERE content LIKE '%<id>%'
       More reliable than read_doc; semantic search may return the wrong paragraph for exact IDs.
-      Chain lookups: find entity A's ID → find the paragraph mentioning it → extract entity B's
-      ID → find entity B's paragraph → extract the attribute you need.
+      Chain lookups: find entity A's ID → use SQL on _paragraphs to fetch its paragraph →
+      read the returned text to extract entity B's ID → SQL again for entity B's paragraph.
+      NEVER re-scan the whole file with regex when you already have a list of specific IDs.
   • Conceptual or semantic lookup (what a term means, finding a policy or rule):
       read_doc with a focused query — a short concept phrase, not the full question.
       For files larger than ~30 KB, always pass a query parameter; large files without
@@ -60,6 +61,13 @@ Step 2 — Read documentation:
   • Exhaustive extraction (need every occurrence of an entity type across a whole document):
       execute_python — read the full file, split by paragraph, extract with regex, print as JSON.
       Process paragraph by paragraph; print only the final structured result, not raw text.
+      After this step you will have a short list of matching IDs — switch to SQL for any
+      further attribute lookups on those IDs (see "Exact identifier lookup" above).
+  • Regex exhaustion fallback: if 2 or more execute_python attempts return 0 useful results
+      on the same document, stop retrying regex. Instead, for each ID you need to look up,
+      run: SELECT content FROM <stem>_paragraphs WHERE content LIKE '%<id>%'
+      Read the returned paragraph text directly — the AI can parse natural-language prose
+      without regex. This always works when the ID appears literally in the text.
 
 Step 3 — Inspect schema and data sources:
   Call show_context_schema. Every file is a potential data source — never conclude "no data
