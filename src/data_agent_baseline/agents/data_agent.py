@@ -109,6 +109,7 @@ Step 5 — Validate before submitting:
   1. Column count: "how many" / "what is the [aggregate]" → 1 column, 1 row.
      "List [X]" → return only the identifier or name column — no supplementary columns.
      "List X and Y" → exactly 2 columns. Never add extra columns not explicitly requested.
+     "Tally" → return only unique identifier or name column — no supplementary columns
   2. Text content: "what is the [comment / title / description / body / message]" →
      return the text column, NOT an ID or uuid column.
      "What is the name of X" → return the name column, not the ID column.
