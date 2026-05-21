@@ -79,10 +79,16 @@ Step 4 — Query and analyse:
   or "current" calculation — never hardcode a year.
 
   SQL rules:
-  - CSV columns are TEXT. Always CAST for numeric comparisons and arithmetic:
+  - CSV columns are TEXT. Always CAST for numeric comparisons and arithmetic.
+    This applies to WHERE filters, ORDER BY, MAX/MIN/AVG/SUM, and subquery comparisons:
       WRONG: WHERE revenue > 1000      ('9' > '10' is TRUE as text)
       RIGHT:  WHERE CAST(revenue AS REAL) > 1000
-    Applies to every numeric filter, sort, and aggregation on CSV-sourced columns.
+      WRONG: MAX(score)               (returns '9' not 14 when score is TEXT)
+      RIGHT:  MAX(CAST(score AS INTEGER))
+      WRONG: WHERE col = (SELECT MAX(score) ...)   (compares text to text — still wrong)
+      RIGHT:  WHERE CAST(col AS INTEGER) = (SELECT MAX(CAST(score AS INTEGER)) ...)
+    The text-sort hazard is especially dangerous in subquery equality checks: always CAST
+    both sides.
   - JSON columns keep native types — no CAST needed.
   - Never use ROUND(), FORMAT(), or Python round() in output. Return raw computed values;
     the evaluation system handles precision normalisation.
@@ -102,6 +108,12 @@ Step 4 — Query and analyse:
     SELECT MIN(col), MAX(col), AVG(col) on the actual data column.
   - If a table is referenced in documentation but missing from the schema ("no such table"),
     the data may live in a prose doc file — load it with execute_python instead.
+  - Compound string IDs (e.g. "entity_1", "entity_2", ..., "entity_10") sort
+    lexicographically as text: "entity_10" < "entity_2". To retrieve the Nth item
+    by natural numeric order, extract and cast the numeric suffix:
+      ORDER BY CAST(SUBSTR(id_col, INSTR(id_col, '_') + 1) AS INTEGER)
+    Apply this whenever an ID column contains a text prefix + numeric suffix and
+    you need position-based selection (e.g. "4th atom", "last entry").
   - Read the DOMAIN ANALYSIS GUIDANCE block in the preflight hint before writing any
     WHERE clause that combines multiple conditions on a longitudinal or time-series table.
 
@@ -109,15 +121,20 @@ Step 5 — Validate before submitting:
   1. Column count: "how many" / "what is the [aggregate]" → 1 column, 1 row.
      "List [X]" → return only the identifier or name column — no supplementary columns.
      "List X and Y" → exactly 2 columns. Never add extra columns not explicitly requested.
-     "Tally" → return only unique identifier or name column — no supplementary columns
-  2. Text content: "what is the [comment / title / description / body / message]" →
-     return the text column, NOT an ID or uuid column.
+     "Tally" → return only the value column — never add a count/frequency column alongside.
+  2. Text content: "what is the [comment / title / description / body / text / message / post]" →
+     return the TEXT column itself, NOT an ID, uuid, or integer column.
      "What is the name of X" → return the name column, not the ID column.
+     This applies even if you found the row by ID — select the content column, not the key column.
   3. Column names from source data — never invent aliases or rename columns.
+     Use the exact column name as it appears in the schema (e.g. `name`, not `race_name`).
   4. Deduplication: "list distinct values" or "tally" → SELECT DISTINCT or GROUP BY.
      Do not add a count column unless the question explicitly asks for frequency.
-  5. Check the preflight hint for TIE RULE, DICT COLUMN, or TIME COLUMN notices —
-     follow those rules exactly before submitting.
+  5. Trust your first correct result: if an initial query returns a plausible answer, verify
+     the logic once, then submit. Do not keep re-querying at wider and wider scope — each
+     revision risks replacing a correct answer with a wrong one.
+  6. Check the preflight hint for TIE HINT, BIDIRECTIONAL TABLE, DICT COLUMN, or TIME COLUMN
+     notices — apply those patterns before submitting.
 
 Step 6 — Submit:
   Call answer with the final result table.

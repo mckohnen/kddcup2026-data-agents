@@ -48,18 +48,46 @@ _FUZZY_MIN_RATIO: float = 0.5
 # Conditional rule detection — drives targeted preflight hint injections
 # ---------------------------------------------------------------------------
 
-_RANKING_KEYWORDS: frozenset[str] = frozenset({
-    "highest", "lowest", "best", "worst", "maximum", "minimum",
-    "largest", "smallest", "most", "fewest", "top", "bottom",
-    "fastest", "slowest", "greatest", "least",
-})
-
 # Time values formatted as [M]M:SS[.mmm] — lap times, race times, durations.
 _TIME_RE = re.compile(r"^\d{1,2}:\d{2}([.,]\d+)?$")
 
+_TIE_RULE_SYSTEM_PROMPT = (
+    "You are a data analysis assistant. Given a question about data, answer with exactly "
+    "one word: YES or NO.\n"
+    "Answer YES if the question asks for a ranking, extreme value, or superlative where "
+    "ties are possible — i.e. multiple rows could share the same maximum, minimum, cheapest, "
+    "most expensive, most frequent, least frequent, fastest, slowest, highest, lowest, best, "
+    "worst, or similar value, and ALL tied rows should be returned.\n"
+    "Answer NO if the question asks for a count, average, sum, percentage, list of all items "
+    "without an extreme filter, a specific named entity, or any other aggregation where "
+    "tie-breaking is not relevant.\n"
+    "Output only YES or NO — no explanation."
+)
 
-def _has_ranking_question(question: str) -> bool:
-    """Return True if the question contains a ranking or superlative keyword."""
+
+def _has_ranking_question(question: str, model: "ModelAdapter | None" = None) -> bool:
+    """Return True if the question implies a tie-sensitive ranking or extreme value.
+
+    When a model is available, uses a fast non-thinking LLM call for semantic detection.
+    Falls back to keyword matching if no model or if the call fails.
+    """
+    if model is not None:
+        from data_agent_baseline.agents.model import ModelMessage  # noqa: PLC0415
+        try:
+            result = model.complete([
+                ModelMessage(role="system", content=_TIE_RULE_SYSTEM_PROMPT),
+                ModelMessage(role="user", content=f"Question: {question}"),
+            ], extra_body=_NO_THINK).strip().upper()
+            return result.startswith("YES")
+        except Exception:
+            pass
+    # Keyword fallback
+    _RANKING_KEYWORDS: frozenset[str] = frozenset({
+        "highest", "lowest", "best", "worst", "maximum", "minimum",
+        "largest", "smallest", "most", "fewest", "top", "bottom",
+        "fastest", "slowest", "greatest", "least", "cheapest", "expensive",
+        "oldest", "youngest", "earliest", "latest", "longest", "shortest",
+    })
     words = set(re.findall(r"\b\w+\b", question.lower()))
     return bool(words & _RANKING_KEYWORDS)
 
@@ -94,6 +122,88 @@ def _detect_time_columns(context: dict) -> list[str]:
     return found
 
 
+def _detect_bidirectional_tables(context: dict, context_dir: "Path | None" = None) -> list[dict]:
+    """Detect symmetric edge/link tables with two FK columns referencing the same entity.
+
+    Pattern 1 — FK-based: two detected relationships from the same table to the same target.
+    Pattern 2 — Name-based: a table has column pairs that share a base name (atom_id / atom_id2,
+      from_id / to_id, node1_id / node2_id, src_id / dst_id, etc.).
+
+    For each detected table, also checks (via SQL) whether both directions are stored as
+    duplicate rows (symmetric storage: A→B AND B→A both present). This determines the
+    correct counting strategy:
+      - Symmetric storage (both rows present): filter by col1 alone — each entity already
+        appears in col1 for every bond it participates in. Using OR or UNION ALL double-counts.
+      - Asymmetric storage (each bond stored once): use UNION ALL over col1 and col2 to
+        count all connections per entity.
+
+    Returns list of dicts: {table, col1, col2, ref_table, symmetric} for each detected pattern.
+    """
+    from data_agent_baseline.tools.context_sqlite import run_sql_on_context  # noqa: PLC0415
+
+    found: list[dict] = []
+    seen: set[str] = set()
+
+    # Pattern 1: two detected FK relationships from same table → same target
+    fk_map: dict[tuple, list[str]] = {}
+    for rel in context.get("relationships", []):
+        key = (rel["from_table"], rel["to_table"])
+        fk_map.setdefault(key, []).append(rel["from_column"])
+    for (from_table, to_table), cols in fk_map.items():
+        if len(cols) >= 2 and from_table not in seen:
+            found.append({"table": from_table, "col1": cols[0], "col2": cols[1], "ref_table": to_table, "symmetric": None})
+            seen.add(from_table)
+
+    # Pattern 2: column name pairs suggesting symmetric edges
+    _BIDIR_PAIRS = [
+        ("_id", "_id2"), ("_id1", "_id2"),
+        ("from_id", "to_id"), ("src_id", "dst_id"),
+        ("node1_id", "node2_id"), ("source_id", "target_id"),
+    ]
+    for table_name, table_info in context.get("tables", {}).items():
+        if table_name in seen:
+            continue
+        cols = list(table_info.get("columns", {}).keys())
+        col_lower = [c.lower() for c in cols]
+        for sfx_a, sfx_b in _BIDIR_PAIRS:
+            for i, ca in enumerate(col_lower):
+                if ca.endswith(sfx_a):
+                    base = ca[: -len(sfx_a)]
+                    expected_b = base + sfx_b
+                    if expected_b in col_lower:
+                        j = col_lower.index(expected_b)
+                        ref_table = base.rstrip("_") if base else table_name
+                        found.append({
+                            "table": table_name,
+                            "col1": cols[i],
+                            "col2": cols[j],
+                            "ref_table": ref_table,
+                            "symmetric": None,
+                        })
+                        seen.add(table_name)
+                        break
+            if table_name in seen:
+                break
+
+    # Detect storage pattern via SQL: symmetric = both (A,B) and (B,A) rows exist
+    if context_dir is not None:
+        for entry in found:
+            tbl, c1, c2 = entry["table"], entry["col1"], entry["col2"]
+            try:
+                q = (
+                    f'SELECT COUNT(*) FROM "{tbl}" t1 '
+                    f'WHERE EXISTS (SELECT 1 FROM "{tbl}" t2 '
+                    f'WHERE t2."{c1}" = t1."{c2}" AND t2."{c2}" = t1."{c1}") LIMIT 1'
+                )
+                result = run_sql_on_context(context_dir, q, limit=1)
+                count = (result.get("rows") or [[0]])[0][0]
+                entry["symmetric"] = isinstance(count, int) and count > 0
+            except Exception:
+                entry["symmetric"] = None  # unknown
+
+    return found
+
+
 def _fuzzy_ratio(a: str, b: str) -> float:
     """Return SequenceMatcher similarity ratio between two strings (0–1)."""
     return SequenceMatcher(None, a.lower(), str(b).lower()).ratio()
@@ -117,6 +227,63 @@ def _extract_knowledge_toc(knowledge_content: str) -> str:
         return "; ".join(headings)
     # No headings — return a short excerpt so agent knows something is there
     return knowledge_content[:200].replace("\n", " ").strip()
+
+
+def _detect_numeric_text_columns(context: dict) -> list[str]:
+    """Return table.column names from CSV tables where values look numeric but are TEXT.
+
+    CSV tables loaded into SQLite store ALL values as TEXT, so MAX(score) on a column
+    with values like '9', '14' returns '9' (lexicographic), not 14 (numeric).
+    We flag columns where:
+    - The table is a plain CSV/JSON source (no "." alias prefix, not a virtual table)
+    - The schema profiler inferred type "number" or "integer"
+    - There are at least 2 distinct values (to avoid trivially constant columns)
+    - The column is not a primary or foreign key (IDs don't need numeric casting)
+    """
+    found: list[str] = []
+    for table_name, table_info in context.get("tables", {}).items():
+        # Skip .db tables (attached as "stem.table") — they have native SQLite types
+        if "." in table_name:
+            continue
+        if table_name.endswith("_paragraphs") or table_name.endswith("_complete"):
+            continue
+        for col, col_info in table_info.get("columns", {}).items():
+            if col_info.get("type") not in ("number", "integer"):
+                continue
+            if col_info.get("unique_count", 0) < 2:
+                continue
+            if col_info.get("role") in ("primary_key", "foreign_key"):
+                continue
+            if col_info.get("id_like"):
+                continue
+            # Also skip camelCase ID columns (e.g. PostId, UserId) that is_id_like misses
+            col_lower = col.lower()
+            if col_lower == "id" or col_lower.endswith("id") and not col_lower.endswith("_id"):
+                # Only skip if the column name IS just an ID carrier (ends in bare "id")
+                # but not something like "valid", "void", etc. — require at least 2 chars prefix
+                if len(col_lower) > 2 and col_lower.endswith("id"):
+                    continue
+            found.append(f"{table_name}.{col}")
+    return found
+
+
+def _has_count_scope_question(question: str) -> bool:
+    """Return True if the question asks for a total/count/aggregate with a condition.
+
+    These questions are at risk of scope-widening: the agent correctly counts X
+    satisfying a condition, then second-guesses and counts all members of qualifying
+    containers instead.  A COUNT SCOPE hint warns against this.
+
+    Only fires when the question includes a count/aggregate keyword AND a
+    conditional preposition ('with', 'in', 'among', 'that', 'having', 'containing').
+    Without the conditional, there is no scope ambiguity risk.
+    """
+    q_lower = question.lower()
+    count_keywords = ("how many", "total", "count", "number of", "sum of", "calculate the")
+    scope_keywords = (" with ", " in ", " among ", " that ", " having ", " containing ")
+    has_count = any(kw in q_lower for kw in count_keywords)
+    has_scope = any(kw in q_lower for kw in scope_keywords)
+    return has_count and has_scope
 
 
 def _detect_empty_string_columns(context: dict, context_dir: "Path") -> list[str]:
@@ -551,15 +718,18 @@ _DOMAIN_EXPERT_SYSTEM_PROMPT = (
     "columns (lab values, scores, metrics) and sample rows show many empty/null cells, the "
     "measurements are collected on different visits — same-row will silently miss most patients. "
     "Choose temporal-proximity or any-row instead.\n\n"
+    "IMPORTANT: Do NOT state specific column values, numeric thresholds, or encodings "
+    "(e.g. do not say 'Thrombosis = 2' or 'WBC > 11'). The agent will read knowledge.md "
+    "directly to obtain those — if you hallucinate them, the agent will use wrong values.\n\n"
     "Output ONLY a JSON object — no preamble, no explanation outside it:\n"
     "{\n"
     '  "domain": "<e.g. clinical/medical | financial/business | sports | manufacturing | general>",\n'
     '  "expert_role": "<e.g. clinical data analyst | financial controller | sports statistician>",\n'
     '  "multi_condition_logic": "<same-row | any-row | temporal-proximity | unclear — '
-    'plus a one-sentence rationale>",\n'
+    'one-sentence structural rationale only, no specific values>",\n'
     '  "guidance": ["<bullet 1>", "<bullet 2>", "<bullet 3>"]\n'
     "}\n\n"
-    "Maximum 3 guidance bullets. Be concise and specific to this question."
+    "Maximum 3 guidance bullets. Structural guidance only — no specific thresholds or encodings."
 )
 
 
@@ -854,10 +1024,13 @@ def build_task_analysis(
         "_schema_tables": schema_tables,
         "domain_guidance": domain_guidance,
         # Conditional rule flags — drive targeted injections in format_task_analysis_hint
-        "has_ranking_question": _has_ranking_question(question),
+        "has_ranking_question": _has_ranking_question(question, model=model),
+        "has_count_scope_question": _has_count_scope_question(question),
         "dict_columns": _detect_dict_columns(context),
         "time_columns": _detect_time_columns(context),
         "empty_string_columns": empty_string_columns,
+        "numeric_text_columns": _detect_numeric_text_columns(context),
+        "bidirectional_tables": _detect_bidirectional_tables(context, context_dir=context_dir),
     }
 
 
@@ -932,14 +1105,52 @@ def format_task_analysis_hint(analysis: dict) -> str:
     # and are instead injected here so the model sees them only when relevant.
     if analysis.get("has_ranking_question"):
         lines.append(
-            "TIE RULE — MANDATORY: This question contains a ranking term "
-            "(highest/lowest/best/worst/most/fewest/etc.). "
-            "You MUST use WHERE col = (SELECT MAX/MIN(col) FROM ...) to capture ALL tied rows. "
-            "NEVER use ORDER BY ... LIMIT 1 — it silently drops tied results even for singular "
-            "phrasing ('the employee with the highest salary' may have multiple equals). "
-            "Pre-answer check: run SELECT COUNT(*) WHERE col = (SELECT MAX/MIN(col) FROM ...). "
-            "If count > 1, return all tied rows."
+            "TIE HINT: This question asks for an extreme or ranked value where multiple rows "
+            "could share the same result. Consider using WHERE col = (SELECT MAX/MIN(col) FROM ...) "
+            "instead of ORDER BY ... LIMIT 1 to capture all tied rows. After your query, "
+            "verify: could another row have the same value? If yes, include it."
         )
+
+    if analysis.get("has_count_scope_question"):
+        lines.append(
+            "COUNT SCOPE HINT: 'Total/count of X [with/in/among/containing] Y' means "
+            "count X entities that DIRECTLY satisfy the condition — not all entities in "
+            "containers that happen to contain some qualifying X. "
+            "Example: 'total atoms with triple-bond molecules containing p' = count atoms "
+            "WHERE element=p AND molecule has a triple bond (not all atoms in those molecules). "
+            "A count of 1 is a perfectly valid final answer — do NOT widen the scope to "
+            "increase the count."
+        )
+
+    bidir = analysis.get("bidirectional_tables", [])
+    if bidir:
+        for b in bidir[:2]:
+            sym = b.get("symmetric")
+            if sym is True:
+                lines.append(
+                    f"BIDIRECTIONAL TABLE (symmetric storage): '{b['table']}' stores each "
+                    f"relationship in BOTH directions — (A,B) and (B,A) are separate rows. "
+                    f"This means '{b['col1']}' already contains every entity for all its bonds. "
+                    f"To count bonds per entity: GROUP BY {b['col1']}, COUNT(*). "
+                    f"Do NOT use OR / UNION ALL — both directions are already in {b['col1']}."
+                )
+            elif sym is False:
+                lines.append(
+                    f"BIDIRECTIONAL TABLE (asymmetric storage): '{b['table']}' stores each "
+                    f"relationship ONCE — an entity can appear in either '{b['col1']}' or '{b['col2']}'. "
+                    f"To count all connections per entity, use UNION ALL:\n"
+                    f"  SELECT {b['col1']} AS id FROM {b['table']} UNION ALL "
+                    f"SELECT {b['col2']} AS id FROM {b['table']}\n"
+                    f"then GROUP BY id and COUNT(*). Do NOT use OR — it double-counts."
+                )
+            else:
+                lines.append(
+                    f"BIDIRECTIONAL TABLE: '{b['table']}' has two FK columns "
+                    f"({b['col1']}, {b['col2']}) both referencing '{b['ref_table']}'. "
+                    f"First check if rows are stored once or twice per bond, then choose: "
+                    f"symmetric storage → GROUP BY {b['col1']} only; "
+                    f"asymmetric → UNION ALL of both columns."
+                )
 
     dict_cols = analysis.get("dict_columns", [])
     if dict_cols:
@@ -964,18 +1175,18 @@ def format_task_analysis_hint(analysis: dict) -> str:
             "+ CAST(SUBSTR(col,INSTR(col,':')+1) AS REAL)) ASC."
         )
 
-    # Domain expert guidance — injected prominently so the agent reads it before querying.
-    # The multi_condition_logic classification is always shown (valuable signal for join strategy).
-    # Prescriptive guidance bullets are only shown for non-trivial multi-condition logic
-    # (temporal-proximity, any-row, unclear) where they provide genuine value. For same-row
-    # tasks the bullets tend to prescribe wrong formulas/interpretations, so we suppress them.
+    # Domain expert guidance — only show prescriptive bullets for temporal-proximity logic,
+    # where the join pattern is genuinely non-obvious (date arithmetic, self-join on patient_id).
+    # For same-row and any-row the classification label alone is the useful signal;
+    # bullets for those cases tend to prescribe wrong encodings (e.g. Thrombosis IN (1,2))
+    # that override what the agent would correctly read from knowledge.md.
     dg = analysis.get("domain_guidance", {})
     if dg:
         role = dg.get("expert_role", dg.get("domain", "domain expert"))
         mc_logic = dg.get("multi_condition_logic", "")
         guidance_bullets = dg.get("guidance", [])
         mc_logic_type = mc_logic.split("—")[0].strip().lower() if mc_logic else ""
-        show_bullets = mc_logic_type not in ("same-row", "")
+        show_bullets = mc_logic_type == "temporal-proximity"
         lines.append(f"\nDOMAIN ANALYSIS GUIDANCE (perspective: {role}):")
         if mc_logic:
             lines.append(f"  Multi-condition logic: {mc_logic}")
@@ -1016,6 +1227,19 @@ def format_task_analysis_hint(analysis: dict) -> str:
             "that CAST to 0 in SQL — this silently distorts AVG, SUM, MIN, MAX. "
             "Always filter before numeric aggregation: "
             "WHERE col != '' AND col IS NOT NULL"
+        )
+
+    numeric_text_cols = analysis.get("numeric_text_columns", [])
+    if numeric_text_cols:
+        col_list = ", ".join(numeric_text_cols[:8]) + (" …" if len(numeric_text_cols) > 8 else "")
+        lines.append(
+            f"NUMERIC TEXT COLUMNS: {col_list} — these CSV columns contain numbers but "
+            "are stored as TEXT in SQLite. Always CAST for MAX, MIN, AVG, SUM, ORDER BY, "
+            "WHERE comparisons, and subquery equality checks. "
+            "WRONG: MAX(score) → may return '9' not 14. "
+            "RIGHT: MAX(CAST(score AS INTEGER)). "
+            "WRONG: WHERE col = (SELECT MAX(score) ...) — text vs text, still wrong. "
+            "RIGHT: WHERE CAST(col AS INTEGER) = (SELECT MAX(CAST(score AS INTEGER)) ...)"
         )
 
     knowledge_toc = analysis.get("knowledge_toc", "")

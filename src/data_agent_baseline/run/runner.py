@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import json
 import multiprocessing
+import os
+import tempfile
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -328,24 +330,38 @@ def _run_one_attempt_in_subprocess(
     prior_summaries: list[str],
     attempt_idx: int,
     queue: multiprocessing.Queue[Any],
+    result_file: str,
     override_max_steps: int | None = None,
 ) -> None:
+    """Run one attempt and write the result to *result_file* on disk.
+
+    Only a tiny signal is sent through the queue so we never hit the ~2 MB
+    pipe-buffer limit that causes a deadlock when a large trace is put directly
+    into a multiprocessing.Queue on macOS/Linux.
+    """
     log_path = Path(str(config.run.output_dir)) / config.run.run_id / task_id / "agent.log"
     setup_task_logger(log_path, attempt=attempt_idx + 1)
     try:
-        queue.put(
-            {
-                "ok": True,
-                "run_result": _run_one_attempt_core(
-                    task_id=task_id,
-                    config=config,
-                    prior_summaries=prior_summaries,
-                    is_first_attempt=(attempt_idx == 0),
-                    override_max_steps=override_max_steps,
-                ),
-            }
+        run_result = _run_one_attempt_core(
+            task_id=task_id,
+            config=config,
+            prior_summaries=prior_summaries,
+            is_first_attempt=(attempt_idx == 0),
+            override_max_steps=override_max_steps,
         )
+        Path(result_file).write_text(
+            json.dumps({"ok": True, "run_result": run_result}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        queue.put({"ok": True})
     except BaseException as exc:  # noqa: BLE001
+        try:
+            Path(result_file).write_text(
+                json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
         queue.put({"ok": False, "error": str(exc)})
     finally:
         close_task_logger()
@@ -392,11 +408,17 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
         # First attempt: add preflight budget.  Resumptions skip preflight.
         subprocess_budget = attempt_timeout + (preflight_budget if total_attempt_idx == 0 else 0)
 
+        # Use a temp file for the result payload so we never hit the ~2 MB
+        # pipe-buffer limit that causes a deadlock when the queue receives a
+        # large trace on macOS/Linux.  Only a tiny signal goes through the queue.
+        result_fd, result_file = tempfile.mkstemp(suffix=".json", prefix=f"attempt_{total_attempt_idx}_")
+        os.close(result_fd)
+
         ctx = multiprocessing.get_context("spawn")
         queue: multiprocessing.Queue[Any] = ctx.Queue()
         process = ctx.Process(
             target=_run_one_attempt_in_subprocess,
-            args=(task_id, config, prior_summaries, total_attempt_idx, queue, override_max_steps),
+            args=(task_id, config, prior_summaries, total_attempt_idx, queue, result_file, override_max_steps),
         )
         process.start()
         process.join(subprocess_budget)
@@ -407,21 +429,28 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
             if process.is_alive():
                 process.kill()
                 process.join()
+            Path(result_file).unlink(missing_ok=True)
             run_result = _failure_run_result_payload(
                 task_id,
                 f"Attempt {total_attempt_idx + 1} timed out after {subprocess_budget}s.",
             )
-        elif queue.empty():
-            exit_code = process.exitcode
-            msg = (
-                f"Attempt {total_attempt_idx + 1} exited unexpectedly (code {exit_code})."
-                if exit_code not in (None, 0)
-                else f"Attempt {total_attempt_idx + 1} exited without returning a result."
-            )
-            run_result = _failure_run_result_payload(task_id, msg)
         else:
-            item = queue.get()
-            if item.get("ok"):
+            # Read result from disk regardless of whether a queue signal arrived.
+            # This handles the edge case where the process wrote the file but died
+            # before putting anything in the queue.
+            item: dict[str, Any] = {}
+            try:
+                raw = Path(result_file).read_text(encoding="utf-8")
+                item = json.loads(raw)
+            except Exception:
+                pass
+            finally:
+                try:
+                    Path(result_file).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+            if item.get("ok") and "run_result" in item:
                 run_result = dict(item["run_result"])
                 cumulative_input += run_result.pop("input_tokens", 0)
                 cumulative_output += run_result.pop("output_tokens", 0)
@@ -429,11 +458,19 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
                     preflight_result = run_result.pop("preflight", {})
                 else:
                     run_result.pop("preflight", None)
-            else:
+            elif item.get("ok") is False:
                 run_result = _failure_run_result_payload(
                     task_id,
                     f"Attempt {total_attempt_idx + 1} failed with uncaught error: {item.get('error', 'unknown')}",
                 )
+            else:
+                exit_code = process.exitcode
+                msg = (
+                    f"Attempt {total_attempt_idx + 1} exited unexpectedly (code {exit_code})."
+                    if exit_code not in (None, 0)
+                    else f"Attempt {total_attempt_idx + 1} exited without returning a result."
+                )
+                run_result = _failure_run_result_payload(task_id, msg)
 
         last_result = run_result
 
@@ -614,13 +651,20 @@ def run_benchmark(
                     progress_callback(artifact)
             task_artifacts = [artifact for artifact in indexed_artifacts if artifact is not None]
 
-    # Second-chance pass: re-run any tasks that produced no answer (timed out or
-    # deadlocked). Uses the same worker count as the first pass so retries run in
-    # parallel — sequential retries waste time when multiple tasks fail at once.
-    failed_ids = [
-        a.task_id for a in task_artifacts
-        if not a.succeeded and a.prediction_csv_path is None
-    ]
+    # Second-chance pass: re-run tasks that timed out or crashed before they could
+    # use their full resumption budget.  Tasks that exhausted max_steps across all
+    # official slots have already used their full budget — do NOT re-run them, as
+    # that would restart from scratch and erase prior resumption progress.
+    def _is_wall_clock_failure(artifact: TaskRunArtifacts) -> bool:
+        reason = (artifact.failure_reason or "").lower()
+        return (
+            not artifact.succeeded
+            and artifact.prediction_csv_path is None
+            and ("timed out" in reason or "exited" in reason or "no attempts" in reason)
+            and "max_steps" not in reason
+        )
+
+    failed_ids = [a.task_id for a in task_artifacts if _is_wall_clock_failure(a)]
     if failed_ids:
         retry_artifacts: dict[str, TaskRunArtifacts] = {}
         for task_id in failed_ids:
