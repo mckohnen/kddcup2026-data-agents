@@ -113,27 +113,11 @@ Step 4 — Query and analyse:
     it returns. Do not discard rows based on subjective reasoning.
   - For the 'type of X' questions: GROUP BY the short categorical type column (e.g.
     event.type, category), not a description or name field.
-  - For any threshold, cutoff, reference range, or "normal vs abnormal" comparison:
-    if 2 read_knowledge_section or search_doc calls fail to surface a definitive
-    value for the term, IMMEDIATELY call lookup_reference_range. Do NOT keep
-    issuing more searches — the tool already searches the docs first and falls
-    back to domain knowledge in one step. This applies to clinical/lab ranges,
-    business KPI thresholds, and any other "what counts as X" cutoff.
-    The tool returns a structured dict: {normal_range: {lower, upper, units},
-    abnormal_condition, confidence, source, raw_extracted_text}. The
-    abnormal_condition field is a plain-English WHERE-clause description you
-    can translate directly into SQL — do NOT re-interpret the raw text.
-    After receiving the range, verify units by running SELECT MIN(col), MAX(col),
-    AVG(col), and the empty/null count on the actual data column.
-  - Unit-mismatch resolution: when normal_range and the data range don't line
-    up cleanly, try standard unit conversions (mg/dL ↔ g/L, cells/µL ↔ ×10⁹/L,
-    etc.) first. If NO sensible unit conversion brings normal_range inside the
-    observed data range, the data IS in the standard unit and ALL non-empty
-    values fall outside the normal range — meaning every measured patient is
-    "abnormal" (medically realistic: many tests are only ordered on clinical
-    suspicion of abnormality, so the recorded values are pre-selected for
-    abnormality). In that case answer with the count of non-empty rows that
-    also satisfy the other filters.
+  - For any threshold, cutoff, or "normal vs abnormal" comparison: call
+    lookup_reference_range as soon as the term comes up. It returns a
+    structured dict — use the abnormal_condition field directly in your
+    WHERE clause. The tool's next_step instructions cover unit verification
+    and the all-abnormal fallback — read and follow them.
   - If a table is referenced in documentation but missing from the schema ("no such table"),
     the data may live in a prose doc file — load it with execute_python instead.
   - Numeric date/period columns (e.g. Date, YearMonth) may use compact formats:
@@ -803,15 +787,9 @@ def create_data_agent_tool_registry(
                         "answer": answer.strip(),
                         "source": "model_training_knowledge",
                         "next_step": (
-                            "IMPORTANT: run SELECT MIN(col), MAX(col), AVG(col), and the "
-                            "count of empty/null cells on the actual data column. "
-                            "Try standard unit conversions (mg/dL ↔ g/L, cells/µL ↔ ×10⁹/L, etc.) "
-                            "first. If NO unit conversion brings the reference range inside the "
-                            "observed data range, the standard unit applies and ALL non-empty "
-                            "rows are abnormal (medically: tests ordered only on suspicion of "
-                            "abnormality). Use WHERE col IS NOT NULL AND col != '' to count "
-                            "abnormal patients in that case — do not keep searching for a "
-                            "narrower threshold."
+                            "Treat as a starting point.  For numeric thresholds, "
+                            "prefer lookup_reference_range which combines doc search "
+                            "with domain knowledge and returns a structured answer."
                         ),
                     },
                 )
@@ -821,30 +799,121 @@ def create_data_agent_tool_registry(
         specs["consult_domain_knowledge"] = ToolSpec(
             name="consult_domain_knowledge",
             description=(
-                "Query the model's training knowledge about a factual domain question — "
-                "e.g. standard lab reference ranges, clinical thresholds, or well-known "
-                "constants that are not explicitly defined in the context files. "
-                "Use this when 2 or more searches of knowledge.md / doc/ files have not "
-                "yielded a definitive threshold or value. Prefer lookup_reference_range "
-                "for lab/clinical range questions — it searches docs first then falls "
-                "back to domain knowledge in one step. "
-                "CRITICAL: after receiving the answer, immediately verify units by running "
-                "SELECT MIN(col), MAX(col), AVG(col) on the relevant data column. "
-                "General knowledge thresholds may be in different units than the dataset "
-                "(e.g. cells/µL vs ×10⁹/L, g/dL vs g/L). Scale to match the data before filtering. "
-                "If NO unit conversion brings the reference range inside the data range, the "
-                "standard unit applies and ALL non-empty rows are abnormal (medically: tests "
-                "ordered only on suspicion of abnormality). "
-                "The answer reflects general knowledge and may vary by population; treat it as "
-                "a starting point, not ground truth."
+                "Query the model's training knowledge for a factual domain question — "
+                "e.g. well-known constants, business KPI definitions, or facts not in "
+                "the context files.  For lab/clinical reference ranges prefer "
+                "lookup_reference_range, which combines doc search + domain knowledge "
+                "+ structured extraction in one step.  Treat the answer as a starting "
+                "point, not ground truth."
             ),
-            input_schema={"question": "What is the normal range for creatinine in mg/dL?"},
+            input_schema={"question": "What unit is fastestLapTime stored in?"},
         )
         handlers["consult_domain_knowledge"] = _consult_domain_knowledge
 
-        # lookup_reference_range: searches doc files (max 3 per file) then
-        # falls back to domain knowledge — saves the agent many search_doc steps.
+        # lookup_reference_range: a multi-step pipeline that gathers all relevant
+        # threshold info, structures it, and returns a definitive answer.  The data
+        # agent calls this as ONE tool — internal logic does the heavy lifting so
+        # the data agent's system prompt stays slim.
         def _make_lookup_reference_range(task_inner=task):
+            # Constants for the broadened doc search.
+            _MAX_PARAS_PER_FILE = 8   # collect up to N matching paragraphs per file
+            _MAX_TOTAL_PARAS = 20     # absolute cap across all files
+            _PARA_PREVIEW_CHARS = 400
+
+            def _gather_doc_paragraphs(column_inner: str, ctx: str) -> list[str]:
+                """Collect up to _MAX_TOTAL_PARAS matching paragraphs from doc/*.md.
+
+                A paragraph qualifies if it mentions the column name AND any
+                threshold-vocabulary keyword.  This is broader than the prior
+                "first match per file" behaviour — the structured extractor
+                needs multiple data points to triangulate the threshold.
+                """
+                hits: list[str] = []
+                doc_dir = task_inner.context_dir / "doc"
+                if not doc_dir.is_dir():
+                    return hits
+                range_keywords = {
+                    "normal", "abnormal", "range", "threshold", "above",
+                    "below", "limit", "reference", "elevated", "low",
+                    "high", "upper", "lower", "severe", "borderline",
+                }
+                col_lc = column_inner.lower()
+                col_uc = column_inner.upper()
+                # Also try the first few words of the context (e.g. "creatinine level").
+                ctx_token = (ctx or "").lower().split(",")[0].strip()[:30]
+                variants = [v for v in (col_lc, col_uc, ctx_token) if v]
+
+                for doc_file in sorted(doc_dir.glob("*.md")):
+                    if len(hits) >= _MAX_TOTAL_PARAS:
+                        break
+                    try:
+                        text = doc_file.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        continue
+                    paras_this_file = 0
+                    seen_paras: set[int] = set()
+                    for variant in variants:
+                        if variant.lower() not in text.lower():
+                            continue
+                        for para_idx, para in enumerate(text.split("\n\n")):
+                            if para_idx in seen_paras:
+                                continue
+                            para_lc = para.lower()
+                            if variant.lower() not in para_lc:
+                                continue
+                            if not (range_keywords & set(re.findall(r"\w+", para_lc))):
+                                continue
+                            hits.append(f"[{doc_file.name}]: {para.strip()[:_PARA_PREVIEW_CHARS]}")
+                            seen_paras.add(para_idx)
+                            paras_this_file += 1
+                            if (paras_this_file >= _MAX_PARAS_PER_FILE
+                                    or len(hits) >= _MAX_TOTAL_PARAS):
+                                break
+                        if (paras_this_file >= _MAX_PARAS_PER_FILE
+                                or len(hits) >= _MAX_TOTAL_PARAS):
+                            break
+                return hits
+
+            def _domain_knowledge_range(column_inner: str, ctx: str) -> str:
+                """Ask the model's training knowledge for a clinical reference range."""
+                domain_q = (
+                    f"What is the standard clinical reference range for '{column_inner}' "
+                    f"({ctx})? Give ONLY the normal range in concise standard units."
+                )
+                try:
+                    return model.complete([
+                        ModelMessage(role="system", content=_DOMAIN_KNOWLEDGE_SYSTEM_PROMPT),
+                        ModelMessage(role="user", content=domain_q),
+                    ], extra_body={"enable_thinking": False}).strip()
+                except Exception:
+                    return ""
+
+            _NEXT_STEP = (
+                "Use 'abnormal_condition' directly in your WHERE clause "
+                "(remember to CAST text columns to REAL/INTEGER first). "
+                "Verify units: run SELECT MIN(col), MAX(col), AVG(col), and the "
+                "count of empty/null cells on the actual data column. "
+                "If NO unit conversion makes the normal_range overlap with the "
+                "observed data range, the standard unit applies and ALL "
+                "non-empty rows are abnormal (medically: tests ordered only on "
+                "clinical suspicion)."
+            )
+
+            def _wrap_result(structured: dict, source: str, raw: str) -> ToolExecutionResult:
+                return ToolExecutionResult(ok=True, content={
+                    "column": structured.get("_column", ""),
+                    "normal_range": {
+                        "lower": structured["lower"],
+                        "upper": structured["upper"],
+                        "units": structured["units"],
+                    },
+                    "abnormal_condition": structured["abnormal_condition"],
+                    "confidence": structured["confidence"],
+                    "source": source,
+                    "raw_extracted_text": raw[:600],
+                    "next_step": _NEXT_STEP,
+                })
+
             def _lookup_reference_range_impl(_task: "PublicTask", action_input: dict) -> ToolExecutionResult:
                 column = str(action_input.get("column", "")).strip()
                 question_context = str(action_input.get("question_context", "")).strip()
@@ -852,96 +921,86 @@ def create_data_agent_tool_registry(
                     return ToolExecutionResult(ok=False, content={"error": "'column' is required."})
 
                 log_inner = get_logger()
-                col_lower = column.lower()
 
-                # --- Phase 1: search doc files (max 3 keyword variants per file) ---
-                search_hits: list[str] = []
-                doc_dir = task_inner.context_dir / "doc"
-                if doc_dir.is_dir():
-                    range_keywords = {"normal", "range", "threshold", "above", "below", "limit", "reference"}
-                    for doc_file in sorted(doc_dir.glob("*.md")):
-                        text = doc_file.read_text(encoding="utf-8", errors="replace")
-                        text_lower = text.lower()
-                        variants = [col_lower, column.upper(), question_context.lower()[:25]]
-                        found_in_file = False
-                        for variant in variants[:3]:
-                            if variant.lower() in text_lower:
-                                for para in text.split("\n\n"):
-                                    if variant.lower() in para.lower() and range_keywords & set(para.lower().split()):
-                                        search_hits.append(f"[{doc_file.name}]: {para.strip()[:500]}")
-                                        found_in_file = True
-                                        break
-                            if found_in_file:
-                                break
-
-                if search_hits:
-                    log_inner.info("  LOOKUP_RANGE found in docs for column=%r", column)
-                    raw_text = "\n\n".join(search_hits)
-                    structured = _extract_structured_range(
-                        raw_text, model, column, question_context,
+                # --- Phase 1: gather all matching paragraphs across context docs ---
+                doc_hits = _gather_doc_paragraphs(column, question_context)
+                doc_structured: dict | None = None
+                doc_raw = ""
+                if doc_hits:
+                    doc_raw = "\n\n".join(doc_hits)
+                    log_inner.info(
+                        "  LOOKUP_RANGE doc-search: %d paragraph(s) for column=%r",
+                        len(doc_hits), column,
                     )
-                    return ToolExecutionResult(ok=True, content={
-                        "column": column,
-                        "normal_range": {
-                            "lower": structured["lower"],
-                            "upper": structured["upper"],
-                            "units": structured["units"],
-                        },
-                        "abnormal_condition": structured["abnormal_condition"],
-                        "confidence": structured["confidence"],
-                        "source": "context_documents",
-                        "raw_extracted_text": raw_text[:600],
-                        "next_step": (
-                            "Use 'abnormal_condition' directly in your WHERE clause "
-                            "(remember to CAST text columns to REAL/INTEGER first). "
-                            "Verify units: run SELECT MIN(col), MAX(col), AVG(col), and "
-                            "the count of empty/null cells on the actual data column. "
-                            "If NO unit conversion makes the normal_range overlap with the "
-                            "observed data range, the standard unit applies and ALL "
-                            "non-empty rows are abnormal (medically: tests ordered only on "
-                            "clinical suspicion)."
-                        ),
-                    })
+                    doc_structured = _extract_structured_range(
+                        doc_raw, model, column, question_context,
+                    )
+                    doc_structured["_column"] = column
 
-                # --- Phase 2: domain knowledge fallback ---
-                log_inner.info("  LOOKUP_RANGE fallback to domain knowledge for column=%r", column)
-                domain_q = (
-                    f"What is the standard clinical reference range for '{column}' "
-                    f"({question_context})? Give ONLY the normal range in concise standard units."
+                # --- Phase 2: also consult domain knowledge IF docs gave low-confidence
+                # or null bounds.  Many tasks have prose with one data point but no
+                # explicit range — domain knowledge complements the doc context.
+                docs_definitive = (
+                    doc_structured is not None
+                    and doc_structured.get("confidence") == "high"
+                    and (
+                        doc_structured.get("lower") is not None
+                        or doc_structured.get("upper") is not None
+                    )
                 )
-                try:
-                    range_str = model.complete([
-                        ModelMessage(role="system", content=_DOMAIN_KNOWLEDGE_SYSTEM_PROMPT),
-                        ModelMessage(role="user", content=domain_q),
-                    ], extra_body={"enable_thinking": False}).strip()
-                    structured = _extract_structured_range(
-                        range_str, model, column, question_context,
+
+                if docs_definitive:
+                    return _wrap_result(doc_structured, "context_documents", doc_raw)
+
+                # Fall through to domain knowledge.
+                log_inner.info(
+                    "  LOOKUP_RANGE consulting domain knowledge for column=%r (docs: %s)",
+                    column,
+                    "low_confidence" if doc_structured else "no_hits",
+                )
+                domain_raw = _domain_knowledge_range(column, question_context)
+                domain_structured: dict | None = None
+                if domain_raw:
+                    domain_structured = _extract_structured_range(
+                        domain_raw, model, column, question_context,
                     )
-                    return ToolExecutionResult(ok=True, content={
-                        "column": column,
-                        "normal_range": {
-                            "lower": structured["lower"],
-                            "upper": structured["upper"],
-                            "units": structured["units"],
-                        },
-                        "abnormal_condition": structured["abnormal_condition"],
-                        "confidence": structured["confidence"],
-                        "source": "domain_knowledge",
-                        "raw_extracted_text": range_str[:600],
-                        "next_step": (
-                            "Use 'abnormal_condition' directly in your WHERE clause "
-                            "(remember to CAST text columns to REAL/INTEGER first). "
-                            "Verify units: run SELECT MIN(col), MAX(col), AVG(col), and "
-                            "the count of empty/null cells on the actual data column. "
-                            "Domain-knowledge values may be in different units than the "
-                            "dataset (e.g. cells/µL vs ×10⁹/L, mg/dL vs g/L). "
-                            "If NO unit conversion makes the normal_range overlap with the "
-                            "observed data range, the standard unit applies and ALL "
-                            "non-empty rows are abnormal."
+                    domain_structured["_column"] = column
+
+                # Prefer the answer with explicit numeric bounds + higher confidence.
+                def _score(s: dict | None) -> tuple[int, int]:
+                    if s is None:
+                        return (-1, -1)
+                    has_bounds = int(
+                        s.get("lower") is not None or s.get("upper") is not None
+                    )
+                    conf_rank = {"high": 2, "medium": 1, "low": 0}.get(
+                        s.get("confidence", "low"), 0
+                    )
+                    return (has_bounds, conf_rank)
+
+                if _score(domain_structured) > _score(doc_structured):
+                    return _wrap_result(domain_structured, "domain_knowledge", domain_raw)
+                if doc_structured is not None:
+                    return _wrap_result(doc_structured, "context_documents", doc_raw)
+                # Both empty: return a low-confidence envelope rather than failing,
+                # so the agent can decide to commit (e.g. via the all-abnormal fallback).
+                return _wrap_result(
+                    {
+                        "_column": column,
+                        "lower": None,
+                        "upper": None,
+                        "units": None,
+                        "abnormal_condition": (
+                            f"No reference range found for '{column}'. "
+                            f"Run SELECT MIN({column}), MAX({column}), AVG({column}) "
+                            f"and decide whether all non-empty values are likely abnormal."
                         ),
-                    })
-                except Exception as exc:
-                    return ToolExecutionResult(ok=False, content={"error": str(exc)})
+                        "confidence": "low",
+                    },
+                    "no_source",
+                    "",
+                )
+
             return _lookup_reference_range_impl
 
         handlers["lookup_reference_range"] = _make_lookup_reference_range()
