@@ -1644,12 +1644,34 @@ def format_task_analysis_hint(analysis: dict) -> str:
                 f"Do NOT use ISO formats (YYYY-MM-DD) or LIKE '%%-%%-%%' on this column."
             )
 
+    # Knowledge.md handling — inject FULL content when small enough so the agent
+    # sees every Use Case at once (instead of reading sections sequentially and
+    # potentially stopping at the first plausible exemplar).  For larger files,
+    # fall back to a TOC + tool-based on-demand reads.
+    #
+    # 12,000 chars (~3K tokens) cutoff: trades context cost for variance reduction
+    # and saves ~3-5 sequential section reads per task on small-knowledge-base
+    # datasets (most failing-subset files are 5-7K).
+    _KNOWLEDGE_FULL_INJECT_LIMIT = 12_000
+    knowledge_content = analysis.get("knowledge_content", "") or ""
     knowledge_toc = analysis.get("knowledge_toc", "")
-    if knowledge_toc:
+    if knowledge_content and len(knowledge_content) <= _KNOWLEDGE_FULL_INJECT_LIMIT:
+        lines.append(
+            f"\nKNOWLEDGE.MD (full content, {len(knowledge_content)} chars) — "
+            f"the entire knowledge.md is included below.  Read ALL sections "
+            f"(including ALL Use Case exemplars) before writing SQL — pick the "
+            f"exemplar whose semantics match the question, not just the first "
+            f"one that mentions the question's keywords.  Do not call "
+            f"read_knowledge_section for this task; the content is already here:\n"
+            f"```\n{knowledge_content}\n```"
+        )
+    elif knowledge_toc:
         lines.append(
             f"KNOWLEDGE.MD EXISTS — sections: {knowledge_toc}. "
             "You MUST call read_knowledge_section to read the relevant sections "
-            "BEFORE writing any SQL or Python. Do not skip this step."
+            "BEFORE writing any SQL or Python. Read multiple Use Case exemplars "
+            "(not just the first match) so you can pick the one whose semantics "
+            "match the question."
         )
 
     for doc in analysis.get("doc_contents", []):

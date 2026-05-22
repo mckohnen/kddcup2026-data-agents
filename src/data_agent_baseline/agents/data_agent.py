@@ -34,8 +34,15 @@ Step 1 — Explore context:
   Call list_context to see all available files and their sizes.
 
 Step 2 — Read documentation:
-  Always read knowledge.md first. Call read_knowledge_section without a section argument
-  to get the table of contents, then call it again for each relevant section.
+  Read knowledge.md before writing any SQL.  Two cases:
+  (a) If the preflight hint contains a "KNOWLEDGE.MD (full content, N chars)" block
+      with a fenced code section, the entire knowledge.md is ALREADY in your context —
+      do NOT call read_knowledge_section, just re-read the block carefully.
+      Pay particular attention to ALL Use Case exemplars (not just the first one that
+      mentions the question's keyword) so you pick the right table/column pattern.
+  (b) If the preflight only lists section headings ("KNOWLEDGE.MD EXISTS — sections: …"),
+      call read_knowledge_section without a section argument to get the TOC, then call it
+      again for each relevant section.  Read multiple Use Cases before committing.
   Focus on:
   - Column semantics: the question may use a natural-language term that maps to one specific
     column. Multiple similar-sounding columns often exist (e.g. "net_revenue" vs "gross_revenue",
