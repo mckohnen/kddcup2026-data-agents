@@ -65,6 +65,35 @@ _TIE_RULE_SYSTEM_PROMPT = (
 )
 
 
+_TEMPORAL_QUALIFIER_PATTERNS = [
+    re.compile(r"\bwhen\s+(?:the|a|an|their|his|her|its)?\s*\w", re.IGNORECASE),
+    re.compile(r"\bwhile\s+\w", re.IGNORECASE),
+    re.compile(r"\bduring\s+\w", re.IGNORECASE),
+    re.compile(r"\bwithin\s+\d+\s*(?:day|week|month|year)s?\b", re.IGNORECASE),
+    re.compile(r"\bat\s+the\s+same\s+time\b", re.IGNORECASE),
+    re.compile(r"\bconcurrently\b", re.IGNORECASE),
+    re.compile(r"\bsimultaneously\b", re.IGNORECASE),
+    re.compile(r"\bshortly\s+(?:after|before)\b", re.IGNORECASE),
+    re.compile(r"\bat\s+the\s+time\s+of\b", re.IGNORECASE),
+    re.compile(r"\b(?:on|in)\s+the\s+same\s+(?:visit|day|appointment|examination)\b",
+               re.IGNORECASE),
+]
+
+
+def _has_temporal_qualifier(question: str) -> bool:
+    """Return True if the question contains language indicating that two
+    conditions should be evaluated within a temporal window (e.g. "when",
+    "while", "during", "within N days", "at the same time").
+
+    Used to GATE the data-driven any-row override: questions with temporal
+    qualifiers should keep the expert's same-row / temporal-proximity choice;
+    questions without should accept the data signal.
+    """
+    if not question:
+        return False
+    return any(p.search(question) for p in _TEMPORAL_QUALIFIER_PATTERNS)
+
+
 def _has_ranking_question(question: str, model: "ModelAdapter | None" = None) -> bool:
     """Return True if the question implies a tie-sensitive ranking or extreme value.
 
@@ -1727,6 +1756,42 @@ def build_task_analysis(
         except Exception:
             pass
 
+    # CONDITIONAL DATA-DRIVEN OVERRIDE: when at least one question-relevant
+    # column pair has min co-occurrence < 10%, the data signal strongly favours
+    # any-row semantics.  HOWEVER we only override the expert's classification
+    # when the question contains NO temporal qualifiers — otherwise the
+    # question's wording itself indicates the temporal-proximity intent and we
+    # should leave the expert's choice intact (medical context: "had X normal
+    # WHEN Y was elevated" needs a date window, not any-row).
+    if domain_guidance and column_cooccurrence:
+        # Only consider pairs where BOTH columns are question-relevant
+        # (otherwise the signal could be from an irrelevant column-pair).
+        relevant_pairs = [
+            c for c in column_cooccurrence
+            if (
+                f"{c['table']}.{c['col_a']}" in relevant_cols_for_question
+                and f"{c['table']}.{c['col_b']}" in relevant_cols_for_question
+            )
+        ]
+        if relevant_pairs and not _has_temporal_qualifier(question):
+            min_cooccur = min(
+                min(c["cooccur_a"], c["cooccur_b"]) for c in relevant_pairs
+            )
+            cur_logic = domain_guidance.get("multi_condition_logic", "").lower()
+            if min_cooccur < 0.10 and not cur_logic.startswith("any-row"):
+                # Override with a data-driven any-row classification.
+                best = min(
+                    relevant_pairs,
+                    key=lambda c: min(c["cooccur_a"], c["cooccur_b"]),
+                )
+                domain_guidance["multi_condition_logic"] = (
+                    f"any-row — DATA OVERRIDE: {best['col_a']} and {best['col_b']} "
+                    f"co-occur in only {int(min(best['cooccur_a'], best['cooccur_b'])*100)}% "
+                    f"of rows where either is non-empty, so same-row / temporal-proximity "
+                    f"would exclude most valid patients. Use any-row semantics."
+                )
+                domain_guidance["_data_override"] = True
+
     # Run coverage gap extraction — must come after _match_literal_values_sql above
     # which has already cached the SQLite connection.  The extractor injects
     # *_complete tables directly into that cached connection so the Analyst sees
@@ -1973,25 +2038,24 @@ def format_task_analysis_hint(analysis: dict) -> str:
                 lines.append(f"  • {bullet}")
         lines.append("")  # blank line after block
 
-    # Column co-occurrence — raw data signal that supports the multi-condition
-    # logic classification. Only show when there's a meaningful low-co-occurrence
-    # signal (suggests measurements taken on different rows/visits, i.e. any-row
-    # semantics needed) — otherwise the data is just noise.
+    # Column co-occurrence — RAW DATA SIGNAL only.  The interpretation (same-row
+    # vs any-row vs temporal-proximity) lives in the DOMAIN ANALYSIS GUIDANCE
+    # block, which now consumes the same co-occurrence data deterministically.
+    # We show at most ONE pair (lowest co-occurrence) so the agent gets the
+    # signal without verbose prescriptive noise that contradicts the expert.
     cooccur = analysis.get("column_cooccurrence", [])
-    for c in cooccur[:3]:
-        # Only emit when at least one column's co-occurrence rate is low (<40%),
-        # indicating the values are likely measured on separate rows.
-        if min(c["cooccur_a"], c["cooccur_b"]) < 0.4:
+    if cooccur:
+        sorted_pairs = sorted(cooccur, key=lambda c: min(c["cooccur_a"], c["cooccur_b"]))
+        top = sorted_pairs[0]
+        if min(top["cooccur_a"], top["cooccur_b"]) < 0.30:
             lines.append(
-                f"COLUMN CO-OCCURRENCE ({c['table']}): {c['col_a']} has "
-                f"{c['a_non_empty']} non-empty rows; {c['col_b']} has "
-                f"{c['b_non_empty']} non-empty rows; BOTH together in only "
-                f"{c['both_non_empty']} rows "
-                f"({int(c['cooccur_a']*100)}% / {int(c['cooccur_b']*100)}% "
-                f"co-occurrence). Implication: these are typically measured on "
-                f"DIFFERENT rows/visits — use any-row semantics for AND filters "
-                f"(patient ever had {c['col_a']} satisfying ... AND ever had "
-                f"{c['col_b']} satisfying ...), NOT same-row."
+                f"COLUMN CO-OCCURRENCE ({top['table']}): {top['col_a']} non-empty "
+                f"in {top['a_non_empty']} rows, {top['col_b']} non-empty in "
+                f"{top['b_non_empty']} rows, BOTH non-empty in only "
+                f"{top['both_non_empty']} rows "
+                f"({int(top['cooccur_a']*100)}% / {int(top['cooccur_b']*100)}% "
+                f"co-occurrence). Apply the multi-condition logic from the "
+                f"DOMAIN ANALYSIS GUIDANCE block below."
             )
 
     # Filter-scope LLM guidance — when 2+ candidate tables share constraint-
