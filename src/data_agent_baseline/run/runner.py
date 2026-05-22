@@ -18,7 +18,11 @@ from data_agent_baseline.agents.data_agent import DataAgent, summarise_trace_for
 from data_agent_baseline.agents.model import OpenAIModelAdapter
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.config import AppConfig
-from data_agent_baseline.run.voting import vote_on_answer
+from data_agent_baseline.run.voting import (
+    classify_phase1,
+    vote_on_answer,
+    write_phase1_winner,
+)
 from data_agent_baseline.task_logger import close_task_logger, setup_task_logger
 from data_agent_baseline.tools.input_detector import detect_input_files
 from data_agent_baseline.tools.registry import ToolRegistry, create_default_tool_registry
@@ -721,6 +725,9 @@ def run_benchmark(
     # the historical single-run path.
     n_runs = max(1, getattr(config.run, "consistency_runs", 1))
     voting_enabled = n_runs > 1
+    # Adaptive voting: only escalates to n_runs sub-runs for "unclear" tasks;
+    # tasks with identical/subset/subset-reversed phase-1 outcomes finish in 2.
+    adaptive_voting = bool(getattr(config.run, "adaptive_voting", False)) and n_runs >= 3
 
     status_log = TaskStatusLog(run_output_dir / "task_status.json", task_ids)
 
@@ -754,7 +761,122 @@ def run_benchmark(
 
     task_artifacts: list[TaskRunArtifacts]
 
-    if voting_enabled:
+    if voting_enabled and adaptive_voting:
+        # ----- Adaptive voting: phase 1 = 2 sub-runs; phase 2 = N-2 more on
+        # tasks whose phase-1 outcome was UNCLEAR (or both-missing). -----
+        questions = {t.task_id: t.question for t in tasks}
+        judge_model = build_model_adapter(config)
+
+        per_task_subruns: dict[str, list[TaskRunArtifacts | None]] = {
+            tid: [None] * n_runs for tid in task_ids
+        }
+        finished_tasks: dict[str, TaskRunArtifacts] = {}
+        adaptive_decisions: dict[str, str] = {}
+        finished_lock = threading.Lock()
+
+        for tid in task_ids:
+            status_log.mark_running(tid)
+
+        # Phase 1: 2 sub-runs per task, flat into the thread pool.
+        phase1_units = [(tid, i) for tid in task_ids for i in (0, 1)]
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            future_to_unit = {
+                executor.submit(_run_subrun, tid, idx): (tid, idx)
+                for tid, idx in phase1_units
+            }
+            for future in as_completed(future_to_unit):
+                tid, idx = future_to_unit[future]
+                sub_artifact = future.result()
+                with finished_lock:
+                    per_task_subruns[tid][idx] = sub_artifact
+
+        # Classify each task's phase-1 outcome.
+        escalated_tasks: list[str] = []
+        for tid in task_ids:
+            cls = classify_phase1(
+                task_id=tid, task_output_dir=run_output_dir / tid,
+            )
+            adaptive_decisions[tid] = cls["outcome"]
+            if cls["terminate"]:
+                # Phase-1 winner stands.  Copy + summary, aggregate artifact, done.
+                write_phase1_winner(
+                    task_id=tid,
+                    task_output_dir=run_output_dir / tid,
+                    classification=cls,
+                )
+                sub_artifacts = [
+                    a for a in per_task_subruns[tid][:2] if a is not None
+                ]
+                vote_summary = {
+                    "task_id": tid,
+                    "n_runs": 2,
+                    "decision": f"phase1_{cls['outcome']}",
+                    "winner_subrun_idx": cls["winner_subrun_idx"],
+                }
+                task_artifact = _aggregate_voting_artifact(
+                    tid, run_output_dir, sub_artifacts, vote_summary,
+                )
+                finished_tasks[tid] = task_artifact
+                status_log.mark_done(tid, task_artifact)
+                if progress_callback is not None:
+                    progress_callback(task_artifact)
+            else:
+                escalated_tasks.append(tid)
+
+        # Phase 2: launch sub-runs 2..N-1 for escalated tasks.
+        if escalated_tasks:
+            phase2_units = [
+                (tid, i) for tid in escalated_tasks for i in range(2, n_runs)
+            ]
+            with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                future_to_unit = {
+                    executor.submit(_run_subrun, tid, idx): (tid, idx)
+                    for tid, idx in phase2_units
+                }
+                for future in as_completed(future_to_unit):
+                    tid, idx = future_to_unit[future]
+                    sub_artifact = future.result()
+                    with finished_lock:
+                        per_task_subruns[tid][idx] = sub_artifact
+
+            # Vote across all N sub-runs for each escalated task.
+            for tid in escalated_tasks:
+                sub_artifacts = [a for a in per_task_subruns[tid] if a is not None]
+                try:
+                    vote_summary = vote_on_answer(
+                        task_id=tid,
+                        task_output_dir=run_output_dir / tid,
+                        question=questions.get(tid, ""),
+                        n_runs=n_runs,
+                        model=judge_model,
+                    )
+                    vote_summary["phase1_outcome"] = adaptive_decisions[tid]
+                    # Persist updated summary with phase-1 context.
+                    summary_path = run_output_dir / tid / "voting_summary.json"
+                    summary_path.write_text(
+                        json.dumps(vote_summary, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    vote_summary = {
+                        "task_id": tid,
+                        "n_runs": n_runs,
+                        "decision": "error",
+                        "winner_subrun_idx": 0,
+                        "error": str(exc),
+                    }
+                task_artifact = _aggregate_voting_artifact(
+                    tid, run_output_dir, sub_artifacts, vote_summary,
+                )
+                finished_tasks[tid] = task_artifact
+                status_log.mark_done(tid, task_artifact)
+                if progress_callback is not None:
+                    progress_callback(task_artifact)
+
+        task_artifacts = [
+            finished_tasks[tid] for tid in task_ids if tid in finished_tasks
+        ]
+    elif voting_enabled:
         # Build flat work units: (task_id, subrun_idx) for each task × each sub-run.
         # Submit all to a single thread pool so total concurrency stays at max_workers.
         work_units = [(tid, i) for tid in task_ids for i in range(n_runs)]

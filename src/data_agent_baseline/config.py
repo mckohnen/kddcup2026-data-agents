@@ -53,6 +53,12 @@ class RunConfig:
     # When > 1, each task gets N sub-runs under task_<id>/run_<i>/ and the voted
     # winner is copied to task_<id>/prediction.csv for evaluation.
     consistency_runs: int = 1
+    # Adaptive voting: when True (and consistency_runs >= 3), first run only 2
+    # sub-runs per task. If their column-value signatures are identical or one
+    # is a strict subset of the other, terminate early (saves ~60% compute on
+    # stable tasks). Otherwise escalate to consistency_runs total and use the
+    # standard majority/plurality/judge voting on all sub-runs.
+    adaptive_voting: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +117,7 @@ def load_app_config(config_path: Path) -> AppConfig:
         task_timeout_seconds_per_attempt=per_attempt,
         keep_logs=bool(run_payload.get("keep_logs", run_defaults.keep_logs)),
         consistency_runs=int(run_payload.get("consistency_runs", run_defaults.consistency_runs)),
+        adaptive_voting=bool(run_payload.get("adaptive_voting", run_defaults.adaptive_voting)),
     )
     env: dict[str, str] = {}
     for key, value in payload.get("env", {}).items():

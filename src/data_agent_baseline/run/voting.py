@@ -36,6 +36,67 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
+# Column-signature comparison (adaptive voting helpers)
+# ---------------------------------------------------------------------------
+#
+# Adaptive voting compares two predictions at the COLUMN-VALUE level
+# (matching the evaluator's logic — no dependency on column names).
+# Each column becomes a sorted tuple of normalised values; a prediction
+# becomes a frozenset of those tuples.  Two predictions are then either:
+#   - identical:    signatures match exactly
+#   - a_subset_of_b: a's signature is a strict subset of b's (b has extra cols)
+#   - b_subset_of_a: b's signature is a strict subset of a's (a has extra cols)
+#   - unclear:      neither identical nor subset (different content)
+#   - no_predictions: both empty / missing
+# When clear (identical, a_subset_of_b, b_subset_of_a) we can decide in two runs
+# and skip phase-2 escalation. When unclear we escalate to 5 runs for full voting.
+
+
+def _signature_set(pred_path: Path) -> frozenset:
+    """Return a frozenset of per-column sorted-value tuples (evaluator-style).
+
+    Two predictions with the same set of column-value tuples are considered
+    equivalent regardless of column NAMES or ORDER — that matches the way the
+    competition evaluator does column matching.
+    """
+    if not pred_path.exists():
+        return frozenset()
+    try:
+        _headers, columns = _read_csv_with_headers(pred_path)
+    except Exception:
+        return frozenset()
+    # Each column is already (sorted, normalised) by _read_csv_with_headers.
+    return frozenset(tuple(col) for col in columns)
+
+
+# Outcome labels for ``classify_signature_pair``.
+SIG_IDENTICAL = "identical"
+SIG_A_SUBSET_OF_B = "a_subset_of_b"   # a's columns are all in b; b has extras
+SIG_B_SUBSET_OF_A = "b_subset_of_a"   # b's columns are all in a; a has extras
+SIG_UNCLEAR = "unclear"
+SIG_NO_PREDICTIONS = "no_predictions"
+
+
+def classify_signature_pair(sig_a: frozenset, sig_b: frozenset) -> str:
+    """Compare two prediction signatures and return one of SIG_* constants.
+
+    Note: when only one side has predictions and the other is empty, this is
+    considered ``unclear`` (escalate to phase 2). The user's adaptive design
+    requires identical/subset/subset-reversed for phase-1 termination.
+    """
+    if not sig_a and not sig_b:
+        return SIG_NO_PREDICTIONS
+    if sig_a == sig_b:
+        return SIG_IDENTICAL
+    # Strict subset (b has extras beyond a).
+    if sig_a and sig_a < sig_b:
+        return SIG_A_SUBSET_OF_B
+    if sig_b and sig_b < sig_a:
+        return SIG_B_SUBSET_OF_A
+    return SIG_UNCLEAR
+
+
+# ---------------------------------------------------------------------------
 # Canonicalisation
 # ---------------------------------------------------------------------------
 
@@ -219,6 +280,119 @@ def _heuristic_pick(candidates: list[_Candidate]) -> int:
         return (missing, failed, c.n_columns, c.subrun_idx)
 
     return min(candidates, key=_key).subrun_idx
+
+
+def classify_phase1(
+    *,
+    task_id: str,
+    task_output_dir: Path,
+) -> dict[str, Any]:
+    """Inspect the two phase-1 sub-run predictions and decide whether to
+    terminate adaptive voting at phase 1 (clear outcome) or escalate to phase 2.
+
+    Returns a dict:
+      {
+        "task_id": ..., "phase": "1",
+        "outcome": <SIG_*>,
+        "terminate": bool,
+        "winner_subrun_idx": int | None,  # only set when terminate=True
+        "sig_0_size": int, "sig_1_size": int,
+      }
+
+    Termination cases (per user-confirmed design):
+      - SIG_IDENTICAL                → take subrun 0
+      - SIG_A_SUBSET_OF_B (a smaller) → take subrun 0 (the minimal one)
+      - SIG_B_SUBSET_OF_A (b smaller) → take subrun 1 (the minimal one)
+
+    Escalation cases (proceed to phase 2):
+      - SIG_UNCLEAR
+      - SIG_NO_PREDICTIONS  (neither phase-1 sub-run produced output)
+      - Anything else (incl. only-one-has-prediction; the user's design treats
+        that as not-clearly-resolved → escalate)
+
+    This function does NOT copy any prediction.csv yet; the caller decides
+    whether to copy the winner (on terminate) or wait for phase 2.
+    """
+    pred_0 = task_output_dir / "run_0" / "prediction.csv"
+    pred_1 = task_output_dir / "run_1" / "prediction.csv"
+    sig_0 = _signature_set(pred_0)
+    sig_1 = _signature_set(pred_1)
+    outcome = classify_signature_pair(sig_0, sig_1)
+
+    terminate = False
+    winner_idx: int | None = None
+    if outcome == SIG_IDENTICAL:
+        terminate = True
+        winner_idx = 0
+    elif outcome == SIG_A_SUBSET_OF_B:
+        # a (subrun 0) has the minimal column set → take it (strips extras).
+        terminate = True
+        winner_idx = 0
+    elif outcome == SIG_B_SUBSET_OF_A:
+        # b (subrun 1) has the minimal column set → take it.
+        terminate = True
+        winner_idx = 1
+
+    return {
+        "task_id": task_id,
+        "phase": "1",
+        "outcome": outcome,
+        "terminate": terminate,
+        "winner_subrun_idx": winner_idx,
+        "sig_0_size": len(sig_0),
+        "sig_1_size": len(sig_1),
+    }
+
+
+def write_phase1_winner(
+    *,
+    task_id: str,
+    task_output_dir: Path,
+    classification: dict[str, Any],
+) -> None:
+    """Copy the phase-1 winning sub-run's prediction.csv to the top level and
+    write a voting_summary.json reflecting the phase-1 decision."""
+    winner_idx = classification.get("winner_subrun_idx")
+    if winner_idx is None:
+        return  # nothing to copy; the caller should escalate
+
+    winner_path = task_output_dir / f"run_{winner_idx}" / "prediction.csv"
+    final_path = task_output_dir / "prediction.csv"
+    if winner_path.exists():
+        final_path.write_bytes(winner_path.read_bytes())
+    else:
+        if final_path.exists():
+            final_path.unlink(missing_ok=True)
+
+    # Build a minimal summary so audits look like the standard voting case.
+    candidates: list[dict] = []
+    for i in (0, 1):
+        sub = task_output_dir / f"run_{i}"
+        pred = sub / "prediction.csv"
+        canonical, headers, n_cols, n_rows = _canonicalise(pred)
+        candidates.append({
+            "subrun_idx": i,
+            "n_columns": n_cols,
+            "n_rows": n_rows,
+            "headers": headers,
+            "has_prediction": canonical is not None,
+            "canonical": (
+                canonical[:300] + "…" if canonical and len(canonical) > 300 else canonical
+            ),
+        })
+
+    summary = {
+        "task_id": task_id,
+        "n_runs": 2,
+        "phase": "1",
+        "decision": f"phase1_{classification['outcome']}",
+        "winner_subrun_idx": winner_idx,
+        "candidates": candidates,
+    }
+    (task_output_dir / "voting_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def vote_on_answer(
