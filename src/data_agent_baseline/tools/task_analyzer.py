@@ -355,6 +355,269 @@ def _detect_date_format_columns(context: dict) -> list[dict]:
     return found
 
 
+_COLUMN_REFERENCE_SYSTEM_PROMPT = (
+    "You are a data analysis assistant. Given a question and a list of column "
+    "names from a database schema, identify which columns the question "
+    "REFERENCES — including via synonyms or domain abbreviations.\n\n"
+    "Examples of synonyms to recognise:\n"
+    "  - 'white blood cells' → WBC, 'fibrinogen' → FG, 'creatinine' → CRE\n"
+    "  - 'red blood cells' → RBC, 'platelets' → PLT, 'uric acid' → UA\n"
+    "  - 'birthday' / 'date of birth' → Birthday/DOB, 'sex' / 'gender' → SEX/Gender\n"
+    "  - 'race name' → Name, 'driver age' → derived from dob\n\n"
+    "Output ONLY column names (one per line, exact spelling from the input list). "
+    "No commentary. If no columns from the list are referenced, output exactly: NONE.\n"
+    "Maximum 6 columns."
+)
+
+
+def _question_relevant_columns(
+    question: str,
+    context: dict,
+    knowledge_content: str,
+    model: "ModelAdapter | None" = None,
+) -> set[str]:
+    """Identify columns that are likely the question's referents, including via
+    synonyms and domain abbreviations (e.g. "white blood cells" → WBC).
+
+    Uses an LLM call when a model is available (most reliable). Falls back to
+    a knowledge.md context-window heuristic when no model.
+
+    Returns set of "<table>.<column>" strings.
+    """
+    if not question:
+        return set()
+
+    # Build the column→table map for non-ID columns across all tables.
+    col_to_tables: dict[str, list[str]] = {}
+    for tbl, tbl_info in context.get("tables", {}).items():
+        if tbl.endswith("_paragraphs") or tbl.endswith("_complete"):
+            continue
+        for col, col_info in tbl_info.get("columns", {}).items():
+            if col_info.get("id_like"):
+                continue
+            if col_info.get("role") in ("primary_key", "foreign_key"):
+                continue
+            col_to_tables.setdefault(col, []).append(tbl)
+
+    if not col_to_tables:
+        return set()
+
+    relevant: set[str] = set()
+
+    # --- LLM path (preferred) ---
+    if model is not None:
+        from data_agent_baseline.agents.model import ModelMessage  # noqa: PLC0415
+        col_list_str = ", ".join(sorted(col_to_tables.keys())[:80])
+        user_msg = (
+            f"Question: {question}\n\n"
+            f"Available columns: {col_list_str}\n\n"
+            f"Which of these columns does the question reference?"
+        )
+        try:
+            raw = model.complete(
+                [
+                    ModelMessage(role="system", content=_COLUMN_REFERENCE_SYSTEM_PROMPT),
+                    ModelMessage(role="user", content=user_msg),
+                ],
+                extra_body=_NO_THINK,
+            ).strip()
+        except Exception:
+            raw = ""
+        if raw and not raw.upper().startswith("NONE"):
+            for line in raw.split("\n"):
+                col = line.strip().strip("-*•").strip()
+                # Some LLMs output table.column form; split if present.
+                if "." in col and col.count(".") <= 2:
+                    parts = col.rsplit(".", 1)
+                    col = parts[-1]
+                if col in col_to_tables:
+                    for tbl in col_to_tables[col]:
+                        relevant.add(f"{tbl}.{col}")
+        if relevant:
+            return relevant
+
+    # --- Heuristic fallback (no model or LLM returned nothing useful) ---
+    # Only use the heuristic when LLM is unavailable; it tends to false-positive
+    # on generic tokens like "normal", "level", "patients".
+    if not knowledge_content:
+        # Just look for direct column-name mentions in the question.
+        q_lc = question.lower()
+        for col, tbls in col_to_tables.items():
+            if col.lower() in q_lc:
+                for tbl in tbls:
+                    relevant.add(f"{tbl}.{col}")
+        return relevant
+
+    q_tokens = {
+        t.lower() for t in re.findall(r"\b\w{4,}\b", question)
+        if t.lower() not in {
+            "normal", "abnormal", "level", "levels", "value", "values",
+            "patient", "patients", "have", "with", "from", "where", "which",
+            "their", "they", "them", "many", "much", "than", "that",
+        }
+    }
+    if not q_tokens:
+        return relevant
+    paragraphs = re.split(r"\n\s*\n", knowledge_content)
+    for col, tbls in col_to_tables.items():
+        col_pattern = re.compile(rf"\b{re.escape(col)}\b", re.IGNORECASE)
+        for para in paragraphs:
+            if not col_pattern.search(para):
+                continue
+            para_lc = para.lower()
+            if any(tok in para_lc for tok in q_tokens):
+                for tbl in tbls:
+                    relevant.add(f"{tbl}.{col}")
+                break
+    return relevant
+
+
+def _detect_column_cooccurrence(
+    matched_terms: list[dict],
+    candidate_tables: list[str],
+    context: dict,
+    context_dir: "Path",
+    relevant_cols: set[str] | None = None,
+) -> list[dict]:
+    """For each pair of NON-ID columns in candidate tables, compute their
+    non-empty co-occurrence rate in the data.
+
+    This is the data-driven signal that feeds the domain-expert's same-row vs
+    any-row vs temporal-proximity classification. Low co-occurrence (<40%)
+    means the columns are measured on different rows / visits (any-row filter
+    logic); high co-occurrence (>70%) means they're typically present together
+    (same-row OK).
+
+    We scan ALL non-ID pairs in candidate tables — not just matched columns —
+    because the question often references columns via synonyms the matcher
+    misses (e.g., "white blood cells" → WBC, "fibrinogen" → FG). The format
+    layer filters down to the meaningful pairs (low co-occurrence only).
+
+    Returns list of dicts: {table, col_a, col_b, both_non_empty, a_non_empty,
+    b_non_empty, cooccur_a, cooccur_b} for each meaningful pair.
+    """
+    from data_agent_baseline.tools.context_sqlite import run_sql_on_context  # noqa: PLC0415
+
+    # Scan ALL schema tables (not just candidate_tables) because the matcher
+    # often misses tables whose names don't appear in the question vocabulary
+    # (e.g., "Laboratory" missed when question says "fibrinogen", "WBC").
+    # We narrow by column-level signal: only sparse columns with meaningful
+    # variance, with one exception — question-relevant columns are ALWAYS
+    # included regardless of null density (they're the ones the question
+    # explicitly references; we need their co-occurrence even if very sparse).
+    relevant_cols = relevant_cols or set()
+    by_table: dict[str, set[str]] = {}
+    for tbl, tbl_info in context.get("tables", {}).items():
+        if tbl.endswith("_paragraphs") or tbl.endswith("_complete"):
+            continue
+        # Skip tiny lookup tables; they don't have measurement-style sparsity.
+        if tbl_info.get("row_count", 0) < 20:
+            continue
+        for col, col_info in tbl_info.get("columns", {}).items():
+            if col_info.get("id_like"):
+                continue
+            if col_info.get("role") in ("primary_key", "foreign_key"):
+                continue
+            full = f"{tbl}.{col}"
+            null_ratio = col_info.get("null_ratio", 0.0)
+            is_relevant = full in relevant_cols
+            # Question-relevant columns: always include.
+            # Other columns: only those with meaningful null variance (5%–99%).
+            if not is_relevant:
+                if null_ratio < 0.05 or null_ratio > 0.99:
+                    continue
+            else:
+                # Still skip columns with 0% or 100% null (no signal possible).
+                if null_ratio <= 0.0 or null_ratio >= 1.0:
+                    continue
+            by_table.setdefault(tbl, set()).add(col)
+
+    results: list[dict] = []
+    _MAX_PAIRS = 12
+    for tbl, cols in by_table.items():
+        if len(cols) < 2:
+            continue
+        row_count = context.get("tables", {}).get(tbl, {}).get("row_count", 0)
+        if row_count < 20:
+            continue  # too few rows for co-occurrence to be meaningful
+        # Prioritise pairs where at least one column is question-relevant
+        # (matched directly or via knowledge.md synonym). This ensures the
+        # SQL budget hits the columns that actually matter for the question.
+        col_list = sorted(cols)
+        col_relevance = {
+            c: (f"{tbl}.{c}" in relevant_cols) for c in col_list
+        }
+
+        def _pair_priority(pair: tuple[str, str]) -> int:
+            # Lower is better — prefer both-relevant > one-relevant > neither.
+            r_a, r_b = col_relevance[pair[0]], col_relevance[pair[1]]
+            if r_a and r_b:
+                return 0
+            if r_a or r_b:
+                return 1
+            return 2
+
+        all_pairs = [
+            (col_list[i], col_list[j])
+            for i in range(len(col_list))
+            for j in range(i + 1, len(col_list))
+        ]
+        all_pairs.sort(key=_pair_priority)
+
+        if "." in tbl:
+            alias, base = tbl.split(".", 1)
+            qtbl = f'"{alias}"."{base}"'
+        else:
+            qtbl = f'"{tbl}"'
+
+        def _non_empty_count(col_name: str) -> int | None:
+            try:
+                res = run_sql_on_context(
+                    context_dir,
+                    f"SELECT COUNT(*) FROM {qtbl} WHERE "
+                    f'"{col_name}" IS NOT NULL AND "{col_name}" != \'\'',
+                    limit=1,
+                )
+                return (res.get("rows") or [[0]])[0][0]
+            except Exception:
+                return None
+
+        for col_a, col_b in all_pairs:
+            if len(results) >= _MAX_PAIRS:
+                break
+            a_count = _non_empty_count(col_a)
+            b_count = _non_empty_count(col_b)
+            try:
+                res = run_sql_on_context(
+                    context_dir,
+                    f"SELECT COUNT(*) FROM {qtbl} WHERE "
+                    f'"{col_a}" IS NOT NULL AND "{col_a}" != \'\' AND '
+                    f'"{col_b}" IS NOT NULL AND "{col_b}" != \'\'',
+                    limit=1,
+                )
+                both_count = (res.get("rows") or [[0]])[0][0]
+            except Exception:
+                both_count = None
+
+            if (
+                a_count is None or b_count is None or both_count is None
+                or a_count == 0 or b_count == 0
+            ):
+                continue
+            results.append({
+                "table": tbl,
+                "col_a": col_a,
+                "col_b": col_b,
+                "both_non_empty": int(both_count),
+                "a_non_empty": int(a_count),
+                "b_non_empty": int(b_count),
+                "cooccur_a": round(both_count / a_count, 3),
+                "cooccur_b": round(both_count / b_count, 3),
+                "row_count": int(row_count),
+            })
+    return results
+
+
 def _detect_duplicate_column_matches(
     matched_terms: list[dict],
     candidate_tables: list[str],
@@ -902,21 +1165,47 @@ def _get_domain_expert_guidance(
     knowledge_content: str,
     model: "ModelAdapter",
     context: dict | None = None,
+    cooccurrence: list[dict] | None = None,
 ) -> dict:
     """Return domain-expert analysis guidance for the question.
 
     Returns a dict with keys: domain, expert_role, multi_condition_logic, guidance.
     Returns an empty dict on failure.
+
+    ``cooccurrence``: optional list of column-pair co-occurrence stats. When provided,
+    embedded into the prompt so the expert classifies multi-condition logic using a
+    data-driven signal rather than guessing from schema names alone.
     """
     import json as _json
     from data_agent_baseline.agents.model import ModelMessage  # noqa: PLC0415
 
     context_block = knowledge_content[:2000] if knowledge_content else "(no knowledge document)"
     schema_block = _format_schema_for_domain_expert(context or {})
+
+    # Build a co-occurrence summary the expert can use to decide same-row vs any-row.
+    cooccur_block = ""
+    if cooccurrence:
+        lines = []
+        for c in cooccurrence[:4]:
+            lines.append(
+                f"  {c['table']}.{c['col_a']} non-empty in {c['a_non_empty']} rows, "
+                f"{c['table']}.{c['col_b']} non-empty in {c['b_non_empty']} rows, "
+                f"BOTH non-empty in only {c['both_non_empty']} rows "
+                f"(co-occurrence: {int(c['cooccur_a']*100)}% / {int(c['cooccur_b']*100)}%)."
+            )
+        cooccur_block = (
+            "\n\nColumn co-occurrence (key data signal for same-row vs any-row vs "
+            "temporal-proximity decisions):\n" + "\n".join(lines)
+            + "\nRule: if BOTH-non-empty rate is <30% of either individual rate, the "
+            "measurements are typically taken on separate rows/visits — any-row is "
+            "appropriate. If >70% co-occur, same-row works."
+        )
+
     prompt = (
         f"Question: {question}\n\n"
         f"Table schemas:\n{schema_block}\n\n"
         f"Dataset knowledge excerpt:\n{context_block}"
+        f"{cooccur_block}"
     )
 
     try:
@@ -940,6 +1229,122 @@ _DOC_SCAN_SYSTEM_PROMPT = (
     "measurement values with units, categorical labels, dates). "
     "No preamble, no explanation — only the lines."
 )
+
+
+# ---------------------------------------------------------------------------
+# Filter-scope LLM check (multi-table constraint analysis)
+# ---------------------------------------------------------------------------
+#
+# When the question has a constraint (time period, status, category, value range)
+# AND there are 2+ candidate tables, it's often unclear whether the filter
+# should apply to all joined tables or only some.  A hardcoded "apply to all"
+# rule over-corrects; the right scope depends on the question semantics.
+# A single LLM call at preflight time can resolve this for the data agent.
+
+_FILTER_SCOPE_SYSTEM_PROMPT = (
+    "You are a SQL planning assistant. Your job is to identify WHERE-clause "
+    "constraints in a data-analysis question that could be silently MISAPPLIED "
+    "when joining multiple tables, then say which tables each constraint must "
+    "be applied to.\n\n"
+    "FOCUS ON: time-period constraints (e.g. 'in August 2012', 'during 2024'). "
+    "When the question specifies a time period AND multiple tables each have a "
+    "date column referring to the same event/transaction/visit, the time filter "
+    "MUST be applied to every such table — otherwise rows from other periods "
+    "leak through the join via a non-date key (CustomerID, PatientID, etc.).\n\n"
+    "Other constraints to consider: status/state, value ranges (price > X), "
+    "categorical filters. These usually apply to one table only — flag them "
+    "only when there's a clear multi-table risk.\n\n"
+    "Output format:\n"
+    "  - If you see at least one constraint that should be applied to MULTIPLE "
+    "    tables, output one line per such constraint:\n"
+    "      SCOPE: '<constraint>' → apply to [<table1>, <table2>, ...] | reason: <short>\n"
+    "  - If every constraint applies cleanly to one table only (no multi-table "
+    "    risk), respond with exactly: NONE\n"
+    "  - Maximum 3 SCOPE lines. No preamble, no explanation outside the SCOPE lines.\n"
+    "  - Reason ≤ 15 words.\n"
+    "Tip: a time-period constraint joining a transactions table to a monthly "
+    "aggregates table almost always needs the filter on BOTH tables."
+)
+
+
+def _summarize_tables_for_scope(context: dict, candidate_tables: list[str]) -> str:
+    """Return a compact one-line-per-table schema fingerprint for the scope check."""
+    lines: list[str] = []
+    for tbl in candidate_tables[:6]:  # cap to keep prompt small
+        tbl_info = context.get("tables", {}).get(tbl, {})
+        cols = list(tbl_info.get("columns", {}).keys())
+        # Show first 12 columns to give the LLM signal without overwhelming.
+        col_str = ", ".join(cols[:12]) + (" …" if len(cols) > 12 else "")
+        lines.append(f"  {tbl}: {col_str}")
+    return "\n".join(lines)
+
+
+def _check_filter_scope(
+    question: str,
+    candidate_tables: list[str],
+    context: dict,
+    knowledge_excerpt: str,
+    model: "ModelAdapter | None",
+) -> list[str]:
+    """LLM-driven scope check.  Returns a list of SCOPE: ... lines, possibly empty.
+
+    Fires only when there are 2+ relevant tables in the schema. Uses ALL schema
+    tables (not just candidate_tables) because the question often uses synonyms
+    that the table-name matcher misses (e.g. "transactions" vs `transactions_1k`).
+    Falls back to no hint on model failure.
+    """
+    if model is None:
+        return []
+
+    # Build the relevant-tables list from the full schema, filtering out tiny
+    # lookup tables and paragraph tables.
+    relevant_tables: list[str] = []
+    for tbl, tbl_info in context.get("tables", {}).items():
+        if tbl.endswith("_paragraphs") or tbl.endswith("_complete"):
+            continue
+        if tbl_info.get("row_count", 0) < 10:
+            continue
+        relevant_tables.append(tbl)
+    if len(relevant_tables) < 2:
+        return []
+
+    from data_agent_baseline.agents.model import ModelMessage  # noqa: PLC0415
+
+    schema_block = _summarize_tables_for_scope(context, relevant_tables)
+    if not schema_block:
+        return []
+
+    user_msg = (
+        f"Question: {question}\n\n"
+        f"Candidate tables (with key columns):\n{schema_block}\n\n"
+    )
+    if knowledge_excerpt:
+        user_msg += f"Knowledge context excerpt:\n{knowledge_excerpt[:1500]}\n\n"
+    user_msg += "Identify SCOPE for each constraint that could be misapplied across tables."
+
+    try:
+        raw = model.complete(
+            [
+                ModelMessage(role="system", content=_FILTER_SCOPE_SYSTEM_PROMPT),
+                ModelMessage(role="user", content=user_msg),
+            ],
+            extra_body=_NO_THINK,
+        ).strip()
+    except Exception:
+        return []
+
+    if raw.upper().startswith("NONE") or not raw:
+        return []
+
+    # Extract only lines starting with SCOPE: to ignore any preamble.
+    scope_lines: list[str] = []
+    for line in raw.split("\n"):
+        s = line.strip()
+        if s.upper().startswith("SCOPE:"):
+            scope_lines.append(s)
+        if len(scope_lines) >= 3:
+            break
+    return scope_lines
 
 
 # ---------------------------------------------------------------------------
@@ -1296,12 +1701,29 @@ def build_task_analysis(
         except OSError:
             pass
 
+    # Compute column co-occurrence BEFORE the domain-expert call so the expert
+    # can use the data-driven signal to choose same-row vs any-row vs
+    # temporal-proximity classification.  Pass question-relevant columns
+    # (including knowledge.md-synonym matches) so the limited SQL budget
+    # is spent on pairs that actually matter for this question.
+    relevant_cols_for_question = _question_relevant_columns(
+        question, context, knowledge_content, model=model,
+    )
+    column_cooccurrence = _detect_column_cooccurrence(
+        all_matches, candidate_tables, context, context_dir,
+        relevant_cols=relevant_cols_for_question,
+    )
+
     # Domain expert guidance — one LLM call that adopts the appropriate domain persona
     # and advises on multi-condition logic (same-row / any-row / temporal-proximity).
     domain_guidance: dict = {}
     if model is not None and knowledge_content:
         try:
-            domain_guidance = _get_domain_expert_guidance(question, knowledge_content, model, context=context)
+            domain_guidance = _get_domain_expert_guidance(
+                question, knowledge_content, model,
+                context=context,
+                cooccurrence=column_cooccurrence,
+            )
         except Exception:
             pass
 
@@ -1376,6 +1798,10 @@ def build_task_analysis(
         "date_format_columns": _detect_date_format_columns(context),
         "bidirectional_tables": _detect_bidirectional_tables(context, context_dir=context_dir),
         "duplicate_column_warnings": _detect_duplicate_column_matches(all_matches, candidate_tables, context),
+        "column_cooccurrence": column_cooccurrence,
+        "filter_scope_lines": _check_filter_scope(
+            question, candidate_tables, context, knowledge_content[:1500], model,
+        ),
     }
 
     # Semantic relevance gate — prune column-anchored conditional rules to only
@@ -1546,6 +1972,34 @@ def format_task_analysis_hint(analysis: dict) -> str:
             for bullet in guidance_bullets:
                 lines.append(f"  • {bullet}")
         lines.append("")  # blank line after block
+
+    # Column co-occurrence — raw data signal that supports the multi-condition
+    # logic classification. Only show when there's a meaningful low-co-occurrence
+    # signal (suggests measurements taken on different rows/visits, i.e. any-row
+    # semantics needed) — otherwise the data is just noise.
+    cooccur = analysis.get("column_cooccurrence", [])
+    for c in cooccur[:3]:
+        # Only emit when at least one column's co-occurrence rate is low (<40%),
+        # indicating the values are likely measured on separate rows.
+        if min(c["cooccur_a"], c["cooccur_b"]) < 0.4:
+            lines.append(
+                f"COLUMN CO-OCCURRENCE ({c['table']}): {c['col_a']} has "
+                f"{c['a_non_empty']} non-empty rows; {c['col_b']} has "
+                f"{c['b_non_empty']} non-empty rows; BOTH together in only "
+                f"{c['both_non_empty']} rows "
+                f"({int(c['cooccur_a']*100)}% / {int(c['cooccur_b']*100)}% "
+                f"co-occurrence). Implication: these are typically measured on "
+                f"DIFFERENT rows/visits — use any-row semantics for AND filters "
+                f"(patient ever had {c['col_a']} satisfying ... AND ever had "
+                f"{c['col_b']} satisfying ...), NOT same-row."
+            )
+
+    # Filter-scope LLM guidance — when 2+ candidate tables share constraint-
+    # bearing columns and the question has WHERE-style constraints, the LLM
+    # decides where each constraint should be applied.  Direct quote of the
+    # SCOPE lines so the agent can use them verbatim.
+    for scope_line in analysis.get("filter_scope_lines", [])[:3]:
+        lines.append(f"FILTER SCOPE: {scope_line.replace('SCOPE:', '').strip()}")
 
     # Extracted tables: show prominently; suppress raw coverage warning for handled gaps.
     extracted = analysis.get("extracted_tables", [])

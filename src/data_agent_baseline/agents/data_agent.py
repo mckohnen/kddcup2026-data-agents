@@ -115,6 +115,14 @@ Step 4 — Query and analyse:
     Filter before any numeric aggregation:
       RIGHT: AVG(CASE WHEN col != '' AND col IS NOT NULL THEN CAST(col AS REAL) END)
       RIGHT: MIN(CASE WHEN col != '' AND col IS NOT NULL THEN CAST(col AS REAL) END)
+  - Missing-value reconstruction: if a column you need has NULLs for required rows,
+    do NOT swap to a different column whose meaning differs. First check whether the
+    missing value can be derived from related columns in the same row.
+      Example: if duration_days is NULL but start_date and end_date are both present,
+      compute julianday(end_date) - julianday(start_date) instead of switching to a
+      different duration column whose semantics may not match.
+    Only fall back to a different metric if no reconstruction is possible AND you can
+    justify why the alternative is semantically equivalent to the original column.
   - Never add LIMIT to the final answer query — return all matching rows.
   - Trust your SQL: once the WHERE clause correctly encodes the question, submit every row
     it returns. Do not discard rows based on subjective reasoning.
