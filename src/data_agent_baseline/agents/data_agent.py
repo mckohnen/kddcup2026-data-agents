@@ -113,11 +113,27 @@ Step 4 — Query and analyse:
     it returns. Do not discard rows based on subjective reasoning.
   - For the 'type of X' questions: GROUP BY the short categorical type column (e.g.
     event.type, category), not a description or name field.
-  - For any threshold, cutoff, or "normal vs abnormal" comparison: call
-    lookup_reference_range as soon as the term comes up. It returns a
-    structured dict — use the abnormal_condition field directly in your
-    WHERE clause. The tool's next_step instructions cover unit verification
-    and the all-abnormal fallback — read and follow them.
+  - For any threshold, cutoff, reference range, or "normal vs abnormal" comparison:
+    if 2 read_knowledge_section or search_doc calls fail to surface a definitive
+    value for the term, IMMEDIATELY call lookup_reference_range. Do NOT keep
+    issuing more searches — the tool already searches the docs first and falls
+    back to domain knowledge in one step. This applies to clinical/lab ranges,
+    business KPI thresholds, and any other "what counts as X" cutoff.
+    The tool returns a structured dict: {normal_range: {lower, upper, units},
+    abnormal_condition, confidence, source, raw_extracted_text}. The
+    abnormal_condition field is a plain-English WHERE-clause description you
+    can translate directly into SQL — do NOT re-interpret the raw text.
+    After receiving the range, verify units by running SELECT MIN(col), MAX(col),
+    AVG(col), and the empty/null count on the actual data column.
+  - Unit-mismatch resolution: when normal_range and the data range don't line
+    up cleanly, try standard unit conversions (mg/dL ↔ g/L, cells/µL ↔ ×10⁹/L,
+    etc.) first. If NO sensible unit conversion brings normal_range inside the
+    observed data range, the data IS in the standard unit and ALL non-empty
+    values fall outside the normal range — meaning every measured patient is
+    "abnormal" (medically realistic: many tests are only ordered on clinical
+    suspicion of abnormality, so the recorded values are pre-selected for
+    abnormality). In that case answer with the count of non-empty rows that
+    also satisfy the other filters.
   - If a table is referenced in documentation but missing from the schema ("no such table"),
     the data may live in a prose doc file — load it with execute_python instead.
   - Numeric date/period columns (e.g. Date, YearMonth) may use compact formats:
