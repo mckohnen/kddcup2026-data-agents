@@ -50,10 +50,18 @@ def main() -> None:
             output_dir=OUTPUT_DIR,
             run_id=_RUN_SUBDIR,
             max_workers=4,
-            # 3 escalating attempts per task: 400 s → 600 s → 800 s.
+            # 3 escalating attempts per sub-run: 200 s → 400 s → 600 s.
             # Resumptions are only triggered on max_steps exhaustion, not timeout.
-            task_timeout_seconds_per_attempt=(400, 600, 800),
+            # Strictly more generous than locally-validated (180, 350, 550)
+            # which produced 0.75 on the failing subset — preserves validated
+            # behaviour while keeping Phase B (367 tasks / 12 h) headroom comfortable.
+            task_timeout_seconds_per_attempt=(200, 400, 600),
             preflight_timeout_seconds=30,
+            # Self-consistency voting with adaptive phase-1 termination.
+            # Validated on failing.yaml subset: mean 0.75 (vs 0.7234 without voting).
+            # Adaptive: ~67% of tasks terminate at 2 sub-runs (identical/subset).
+            consistency_runs=5,
+            adaptive_voting=True,
         ),
     )
 
